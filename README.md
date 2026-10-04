@@ -226,6 +226,38 @@ NetworkX has a conversion method for pydot graphs:
 my_networkx_graph = networkx.drawing.nx_pydot.from_pydot(graph)
 ```
 
+#### Canonical form and digest for caching
+
+Re-exporting the same dependency structure with freshly generated
+node IDs normally defeats caches. `canonicalize_graph` produces a
+canonical representation and a SHA-256 digest that only depend on the
+graph structure and the attributes the caller declares semantic --
+never on node names or declaration order. It works on an expanded
+finite graph and supports directed edges, parallel edges and
+self-loops.
+
+```python
+form = pydot.canonicalize_graph(
+    graph,
+    node_attrs=["kind"],
+    edge_attrs=["weight"],
+    budget=10000,
+)
+if form.complete:
+    cache_key = form.digest
+else:
+    # Budget exhausted while separating symmetric structures; do not
+    # use a partial digest, rerun with a larger budget instead.
+    ...
+```
+
+The lower-level `pydot.canonicalize(nodes, edges, ...)` accepts plain
+mappings and tuples without pydot objects. When symmetric structures
+cannot be split by refinement alone the implementation searches
+alternative labelings; `budget` bounds that search and an exhausted
+budget returns `form.complete is False` rather than a fake canonical
+result.
+
 ### More help
 
 For more help, see the docstrings of the various pydot objects and
