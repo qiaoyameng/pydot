@@ -679,6 +679,99 @@ def test_quote_id_with_embedded_double_quote() -> None:
         """)
 
 
+def test_esc_string_graph_node_and_edge_placeholders() -> None:
+    graph = pydot.Dot("", graph_type="digraph", label=r"x\G")
+    node = pydot.Node(r"a\b", label=r"\N \\N\n")
+    edge = pydot.Edge('"a\\b":port_a', '"b:q":port_b', label=r"\E|\T|\H")
+    graph.add_node(node)
+    graph.add_edge(edge)
+
+    assert graph.escString() == ["x"]
+    assert node.escString() == [
+        r"a\b \N",
+        pydot.core.ESC_STRING_CENTER,
+    ]
+    assert edge.escString() == [r"a\b->b:q|a\b|b:q"]
+
+
+def test_esc_string_function_and_edge_label_attributes() -> None:
+    edge = pydot.Edge("a:from", "b:to")
+
+    assert pydot.escString(edge, r"\T:\H", "headlabel") == ["a:b"]
+    assert pydot.esc_string(edge, r"\E", "taillabel") == ["a--b"]
+    assert edge.get("headlabel") is None
+    assert edge.get("taillabel") is None
+
+
+def test_esc_string_line_alignment_and_parsed_values() -> None:
+    dot = textwrap.dedent(r'''
+        digraph "" {
+            "a\b" [label="\N \\N\nl\r"];
+            "a\b":from -> "b:q":to [label="\E\T\H"];
+        }
+    ''')
+    graph = pydot.graph_from_dot_data(dot)[0]
+    node = graph.get_node('"a\\b"')[0]
+    edge = graph.get_edges()[0]
+
+    assert node.escString() == [
+        r"a\b \N",
+        pydot.core.ESC_STRING_CENTER,
+        "l",
+        pydot.core.ESC_STRING_RIGHT,
+    ]
+    assert edge.escString() == [r"a\b->b:qa\bb:q"]
+
+
+def test_esc_string_uses_default_node_label_without_mutation() -> None:
+    node = pydot.Node(r"a\b")
+    edge = pydot.Edge("a", "b")
+
+    assert node.escString() == [r"a\b"]
+    assert edge.escString() == []
+    assert node.get("label") is None
+    assert node.to_string() == '"a\\b";'
+
+
+def test_esc_string_does_not_reinterpret_replaced_names() -> None:
+    graph = pydot.Dot("")
+    node = pydot.Node(r"a\Nb", label=r"\N \\N")
+    graph.add_node(node)
+
+    assert node.escString() == [r"a\Nb \N"]
+    assert graph.escString(label=r"[\G]") == ["[]"]
+    assert node.get("label") == r"\N \\N"
+
+
+def test_esc_string_record_and_html_labels_have_separate_syntax() -> None:
+    record = pydot.Node(
+        "record",
+        shape="record",
+        label=r'{ <port> one | two \| \N | \{ three \} }',
+    )
+    html = pydot.Node(
+        "html",
+        label=r'<b>\N<BR ALIGN="left"/><!-- x -->&amp;</b>',
+    )
+
+    assert record.escString() == [
+        "one",
+        pydot.core.ESC_STRING_CENTER,
+        "two | record",
+        pydot.core.ESC_STRING_CENTER,
+        "{ three }",
+    ]
+    assert html.escString() == [
+        r"\N",
+        pydot.core.ESC_STRING_LEFT,
+        "&",
+    ]
+    assert record.get("label") == r'{ <port> one | two \| \N | \{ three \} }'
+    assert html.get("label") == (
+        r'<b>\N<BR ALIGN="left"/><!-- x -->&amp;</b>'
+    )
+
+
 @pytest.mark.xfail(reason="We mishandle two-colon (id:port:compass) endpoints")
 def test_edge_with_port_and_compass() -> None:
     g = pydot.Graph("G")

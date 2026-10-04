@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import errno
+import html
 import itertools
 import logging
 import os
@@ -15,7 +16,16 @@ import re
 import subprocess
 import sys
 import warnings
-from typing import TYPE_CHECKING, Any, Final, Sequence, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Iterable,
+    NamedTuple,
+    Sequence,
+    Union,
+    cast,
+)
 
 if TYPE_CHECKING:
     # `typing_extensions` is always available in `TYPE_CHECKING` blocks,
@@ -402,6 +412,369 @@ def quote_attr_if_necessary(s: str) -> str:
     return make_quoted(s)
 
 
+class EscStringLineBreak(NamedTuple):
+    """A label line break and the alignment of the line that follows."""
+
+    alignment: str
+
+
+ESC_STRING_CENTER: Final = EscStringLineBreak("center")
+ESC_STRING_LEFT: Final = EscStringLineBreak("left")
+ESC_STRING_RIGHT: Final = EscStringLineBreak("right")
+
+EscStringPart = Union[str, EscStringLineBreak]
+
+
+def _join_esc_string_parts(
+    parts: Iterable[EscStringPart],
+) -> list[EscStringPart]:
+    result: list[EscStringPart] = []
+    text_parts: list[str] = []
+
+    def flush() -> None:
+        if text_parts:
+            text = "".join(text_parts)
+            if text:
+                result.append(text)
+            text_parts.clear()
+
+    for part in parts:
+        if isinstance(part, EscStringLineBreak):
+            flush()
+            result.append(part)
+        else:
+            text_parts.append(part)
+
+    flush()
+    return result
+
+
+def _is_quoted(value: str) -> bool:
+    return len(value) >= 2 and value[0] == '"' and value[-1] == '"'
+
+
+def _strip_quoted(value: str) -> str:
+    if _is_quoted(value):
+        return value[1:-1]
+    return value
+
+
+def _decode_quoted_identifier(value: str) -> str:
+    """Decode a quoted DOT identifier without expanding label escapes."""
+    if not _is_quoted(value):
+        return value
+
+    result = []
+    i = 1
+    end = len(value) - 1
+
+    while i < end:
+        char = value[i]
+        if (
+            char == "\\"
+            and i + 1 < len(value)
+            and value[i + 1] in {'"', "\\"}
+        ):
+            result.append(value[i + 1])
+            i += 2
+        else:
+            result.append(char)
+            i += 1
+
+    return "".join(result)
+
+
+def _identifier(value: EdgeEndpoint) -> str:
+    """Return the logical identifier in a DOT node or graph reference."""
+    if isinstance(value, FrozenDict):
+        return _decode_quoted_identifier(str(value.get("name", "")))
+    if not isinstance(value, str):
+        return str(value)
+    if len(value) >= 2 and value[0] == "<" and value[-1] == ">":
+        return value[1:-1]
+
+    if value.startswith('"'):
+        index = 1
+        while index < len(value):
+            if value[index] == "\\":
+                index += 2
+                continue
+            if value[index] == '"':
+                break
+            index += 1
+        else:
+            return _decode_quoted_identifier(value)
+
+        if index + 1 < len(value) and value[index + 1] == ":":
+            return _decode_quoted_identifier(value[: index + 1])
+        return _decode_quoted_identifier(value)
+
+    port_index = value.find(":")
+    if port_index != -1:
+        return _decode_quoted_identifier(value[:port_index])
+    return _decode_quoted_identifier(value)
+
+
+def _escape_part(
+    char: str, replacements: dict[str, str]
+) -> EscStringPart | None:
+    if char == "\\":
+        return "\\"
+    if char == '"':
+        return '"'
+    if char == "n":
+        return ESC_STRING_CENTER
+    if char == "l":
+        return ESC_STRING_LEFT
+    if char == "r":
+        return ESC_STRING_RIGHT
+    if char in replacements:
+        return replacements[char]
+    return char
+
+
+def _scan_esc_string(
+    value: str, replacements: dict[str, str]
+) -> list[EscStringPart]:
+    parts: list[EscStringPart] = []
+    i = 0
+
+    while i < len(value):
+        if value[i] != "\\" or i + 1 == len(value):
+            parts.append(value[i])
+            i += 1
+            continue
+
+        part = _escape_part(value[i + 1], replacements)
+        if part is not None:
+            parts.append(part)
+        i += 2
+
+    return _join_esc_string_parts(parts)
+
+
+def _record_esc_string(
+    value: str, replacements: dict[str, str]
+) -> list[EscStringPart]:
+    parts: list[EscStringPart] = []
+    field_parts: list[EscStringPart] = []
+    field_has_content = False
+    i = 0
+
+    def flush_field() -> None:
+        nonlocal field_parts, field_has_content
+        field = _join_esc_string_parts(field_parts)
+        if field and isinstance(field[0], str):
+            field[0] = field[0].lstrip()
+        if field and isinstance(field[-1], str):
+            field[-1] = field[-1].rstrip()
+        if field and field[0] == "":
+            field.pop(0)
+        if field and field[-1] == "":
+            field.pop()
+        parts.extend(field)
+        field_parts = []
+        field_has_content = False
+
+    while i < len(value):
+        char = value[i]
+
+        if char == "\\" and i + 1 < len(value):
+            part = _escape_part(value[i + 1], replacements)
+            if part is not None:
+                field_parts.append(part)
+            i += 2
+            field_has_content = True
+            continue
+
+        if not field_has_content:
+            if char.isspace():
+                i += 1
+                continue
+            if char == "<":
+                port_end = value.find(">", i + 1)
+                if port_end != -1:
+                    i = port_end + 1
+                    continue
+
+        if char in {"{", "}"}:
+            i += 1
+            continue
+
+        if char == "|":
+            flush_field()
+            parts.append(ESC_STRING_CENTER)
+            i += 1
+            continue
+
+        field_parts.append(char)
+        i += 1
+        field_has_content = True
+
+    flush_field()
+    if parts and isinstance(parts[-1], EscStringLineBreak):
+        previous = len(parts) - 2
+        if previous < 0 or isinstance(parts[previous], EscStringLineBreak):
+            parts.pop()
+    return _join_esc_string_parts(parts)
+
+
+def _html_line_break(tag: str) -> EscStringLineBreak:
+    match = re.search(
+        r"""align\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+        tag,
+        re.IGNORECASE,
+    )
+    alignment = "center"
+    if match:
+        alignment = next(group for group in match.groups() if group).lower()
+    if alignment == "left":
+        return ESC_STRING_LEFT
+    if alignment == "right":
+        return ESC_STRING_RIGHT
+    return ESC_STRING_CENTER
+
+
+def _find_html_tag_end(value: str, start: int) -> int:
+    quote = ""
+    index = start
+
+    while index < len(value):
+        char = value[index]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == ">":
+            return index
+        index += 1
+
+    return -1
+
+
+def _html_esc_string(value: str) -> list[EscStringPart]:
+    parts: list[EscStringPart] = []
+    i = 0
+
+    while i < len(value):
+        comment_start = value.find("<!--", i)
+        tag_start = value.find("<", i)
+
+        if comment_start != -1 and (
+            tag_start == -1 or comment_start <= tag_start
+        ):
+            parts.append(html.unescape(value[i:comment_start]))
+            comment_end = value.find("-->", comment_start + 4)
+            i = (
+                len(value)
+                if comment_end == -1
+                else comment_end + 3
+            )
+            continue
+
+        if tag_start == -1:
+            parts.append(html.unescape(value[i:]))
+            break
+
+        parts.append(html.unescape(value[i:tag_start]))
+        tag_end = _find_html_tag_end(value, tag_start + 1)
+        if tag_end == -1:
+            parts.append(html.unescape(value[tag_start + 1 :]))
+            break
+
+        tag = value[tag_start + 1 : tag_end]
+        tag_name = tag.strip().strip("/").split()[0].lower()
+        is_closing_tag = tag.startswith("/")
+        if tag_name == "br":
+            parts.append(_html_line_break(tag))
+        elif tag_name == "td" and is_closing_tag:
+            parts.append(ESC_STRING_CENTER)
+        elif tag_name == "tr" and is_closing_tag:
+            parts.append(ESC_STRING_LEFT)
+        i = tag_end + 1
+
+    return _join_esc_string_parts(parts)
+
+
+def _esc_string_replacements(
+    context: Common,
+) -> dict[str, str]:
+    replacements: dict[str, str] = {}
+
+    graph = (
+        context
+        if isinstance(context, Graph)
+        else context.get_parent_graph()
+    )
+    if graph is not None:
+        replacements["G"] = _identifier(cast("str", graph.get_name()))
+
+    if isinstance(context, Node):
+        replacements["N"] = _identifier(context.get_name())
+    elif isinstance(context, Edge):
+        tail = _identifier(context.get_source())
+        head = _identifier(context.get_destination())
+        edge_operator = (
+            "->"
+            if context.get_top_graph_type() == "digraph"
+            else "--"
+        )
+        replacements["E"] = f"{tail}{edge_operator}{head}"
+        replacements["T"] = tail
+        replacements["H"] = head
+
+    return replacements
+
+
+def esc_string(
+    context: Common,
+    label: Any | None = None,
+    attribute: str = "label",
+) -> list[EscStringPart]:
+    """Interpret Graphviz escString escapes in an object's label.
+
+    The object's stored attribute is left unchanged. Substituted names are
+    appended as literals, so their contents are never interpreted again.
+    """
+    if not isinstance(context, Common):
+        raise TypeError("esc_string() requires a graph, node, or edge")
+
+    value = label
+    if value is None:
+        value = context.get(attribute)
+
+    if value is None:
+        if (
+            attribute == "label"
+            and isinstance(context, Node)
+            and context.get_name() not in {"graph", "node", "edge"}
+        ):
+            value = r"\N"
+        else:
+            return []
+
+    if not isinstance(value, str):
+        value = str(value)
+
+    is_html = len(value) >= 2 and value[0] == "<" and value[-1] == ">"
+    raw_value = _strip_quoted(value)
+    replacements = _esc_string_replacements(context)
+
+    if is_html:
+        return _html_esc_string(raw_value)
+
+    if attribute == "label" and isinstance(context, Node):
+        shape = _decode_quoted_identifier(str(context.get("shape") or ""))
+        if shape.lower() in {"record", "mrecord"}:
+            return _record_esc_string(raw_value, replacements)
+
+    return _scan_esc_string(raw_value, replacements)
+
+
+escString = esc_string
+
+
 def graph_from_dot_data(s: str) -> list[Dot] | None:
     """Load graphs from DOT description in string `s`.
 
@@ -672,6 +1045,22 @@ class Common:
         if not attrs:
             return ""
         return f"{prefix}[{', '.join(attrs)}]"
+
+    def escString(
+        self,
+        label: Any | None = None,
+        attribute: str = "label",
+    ) -> list[EscStringPart]:
+        """Interpret Graphviz escString escapes in this object's label."""
+        return esc_string(self, label=label, attribute=attribute)
+
+    def esc_string(
+        self,
+        label: Any | None = None,
+        attribute: str = "label",
+    ) -> list[EscStringPart]:
+        """Interpret Graphviz escString escapes in this object's label."""
+        return esc_string(self, label=label, attribute=attribute)
 
 
 class Node(Common):
