@@ -151,6 +151,404 @@ class frozendict(FrozenDict):
         super().__init__(self, *args, **kwargs)
 
 
+def _effective_node_id(node_ref: EdgeEndpoint) -> str:
+    """Return the node identity referenced by an edge endpoint."""
+    if isinstance(node_ref, (int, float)):
+        return str(node_ref)
+
+    node_ref = str(node_ref)
+    if node_ref.startswith('"'):
+        index = 1
+        while index < len(node_ref):
+            if node_ref[index] == "\\":
+                index += 2
+                continue
+            if node_ref[index] == '"':
+                return node_ref[: index + 1]
+            index += 1
+
+    port_idx = node_ref.find(":")
+    if port_idx > 0:
+        return node_ref[:port_idx]
+    return node_ref
+
+
+class _EffectiveGraphBuilder:
+    """Build a materialized view from a DOT declaration tree."""
+
+    def __init__(self, graph: Graph) -> None:
+        self.source = graph
+        graph_type = graph.get_graph_type()
+        target_cls: type[Graph] = Graph
+        if graph_type == "subgraph":
+            target_cls = Subgraph
+        if isinstance(graph, Cluster):
+            target_cls = Cluster
+        if isinstance(graph, Dot):
+            target_cls = Dot
+        kwargs: dict[str, Any] = {
+            "suppress_disconnected": graph.get_suppress_disconnected(),
+            "simplify": graph.get_simplify(),
+        }
+        if graph_type != "subgraph":
+            kwargs["graph_type"] = graph_type
+            kwargs["strict"] = graph.get_strict()
+        self.target = target_cls(
+            graph.get_name() or "",
+            **kwargs,
+            **copy.deepcopy(graph.get_attributes()),
+        )
+        if isinstance(graph, Subgraph) and not isinstance(graph, Dot):
+            self.target.obj_dict["type"] = "subgraph"
+            self.target.obj_dict["show_keyword"] = graph.obj_dict.get(
+                "show_keyword", True
+            )
+
+        self.nodes: dict[str, Node] = {}
+        self.strict_edges: dict[
+            tuple[str, str], dict[tuple[str, str], Edge]
+        ] = {}
+        self.edge_objects: list[Edge] = []
+        self.endpoint_cache: dict[
+            int, tuple[Graph, tuple[str, ...]]
+        ] = {}
+        self.event_sequence = 0
+        self.graph_type = (
+            graph_type
+            if graph_type != "subgraph"
+            else graph.get_top_graph_type()
+        )
+        parent_graph = graph.get_parent_graph()
+        self.strict = graph.get_strict() or (
+            parent_graph is not None and parent_graph.get_strict()
+        )
+
+    def next_sequence(self) -> int:
+        self.event_sequence += 1
+        return self.event_sequence
+
+    def node(
+        self,
+        name: str,
+        node_defaults: dict[str, Any],
+        sequence: int | None = None,
+    ) -> Node:
+        node = self.nodes.get(name)
+        if node is None:
+            node = Node(name, **copy.deepcopy(node_defaults))
+            node.set_sequence(
+                sequence if sequence is not None else self.next_sequence()
+            )
+            self.nodes[name] = node
+        return node
+
+    def effective_attributes(
+        self,
+        defaults: dict[str, Any],
+        explicit: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            **copy.deepcopy(defaults),
+            **copy.deepcopy(explicit),
+        }
+
+    def edge_key(
+        self,
+        source_id: str,
+        destination_id: str,
+    ) -> tuple[str, str]:
+        if self.graph_type == "graph":
+            pair = tuple(sorted((source_id, destination_id)))
+            return cast("tuple[str, str]", pair)
+        return source_id, destination_id
+
+    def ordered_events(
+        self,
+        graph: Graph,
+    ) -> list[tuple[int, str, Any]]:
+        events: list[tuple[int, str, Any]] = []
+        events.extend(
+            (node.get_sequence(), "node", node)
+            for node in graph.get_node_list()
+        )
+        events.extend(
+            (edge.get_sequence(), "edge", edge)
+            for edge in graph.get_edge_list()
+        )
+        events.extend(
+            (subgraph.get_sequence(), "subgraph", subgraph)
+            for subgraph in graph.get_subgraph_list()
+        )
+        events.sort(key=lambda event: event[0])
+        return events
+
+    def add_node(
+        self,
+        graph: Graph,
+        node: Node,
+        node_defaults: dict[str, Any],
+        members: set[str],
+        member_order: list[str],
+        sequence: int | None = None,
+    ) -> None:
+        raw_name = node.get_name()
+        if any(
+            self.is_default_statement(node, keyword)
+            for keyword in ("graph", "node", "edge")
+        ):
+            return
+
+        name = _effective_node_id(raw_name)
+        effective_node = self.node(name, node_defaults, sequence)
+        effective_node.get_attributes().update(
+            copy.deepcopy(node.get_attributes())
+        )
+        if name not in members:
+            graph.obj_dict["nodes"][name] = [effective_node.obj_dict]
+            members.add(name)
+            member_order.append(name)
+
+    @staticmethod
+    def add_members(
+        names: tuple[str, ...],
+        members: set[str],
+        member_order: list[str],
+    ) -> None:
+        for name in names:
+            if name not in members:
+                members.add(name)
+                member_order.append(name)
+
+    def endpoint_subgraph(
+        self,
+        endpoint: FrozenDict,
+        node_defaults: dict[str, Any],
+        edge_defaults: dict[str, Any],
+        members: set[str],
+        member_order: list[str],
+    ) -> tuple[Graph, tuple[str, ...]]:
+        cache_key = id(endpoint)
+        cached = self.endpoint_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        source = Subgraph(obj_dict=endpoint)
+        target = self.make_target_subgraph(source)
+        endpoint_members = self.process_scope(
+            source,
+            target,
+            copy.deepcopy(node_defaults),
+            copy.deepcopy(edge_defaults),
+        )
+        result = (target, tuple(endpoint_members))
+        self.endpoint_cache[cache_key] = result
+        self.add_members(
+            tuple(endpoint_members), members, member_order
+        )
+        return result
+
+    def endpoint_nodes(
+        self,
+        endpoint: EdgeEndpoint,
+        node_defaults: dict[str, Any],
+        edge_defaults: dict[str, Any],
+        members: set[str],
+        member_order: list[str],
+        sequence: int,
+    ) -> tuple[tuple[EdgeEndpoint, ...], tuple[str, ...]]:
+        if isinstance(endpoint, FrozenDict):
+            _, names = self.endpoint_subgraph(
+                endpoint,
+                node_defaults,
+                edge_defaults,
+                members,
+                member_order,
+            )
+            return names, names
+
+        node_id = _effective_node_id(endpoint)
+        self.node(node_id, node_defaults, sequence)
+        self.add_members((node_id,), members, member_order)
+        return (endpoint,), (node_id,)
+
+    @staticmethod
+    def is_default_statement(node: Node, keyword: str) -> bool:
+        name = node.get_name()
+        return name.lower() == keyword and not (
+            name.startswith('"') and name.endswith('"')
+        )
+
+    def add_edge(
+        self,
+        graph: Graph,
+        edge: Edge,
+        node_defaults: dict[str, Any],
+        edge_defaults: dict[str, Any],
+        members: set[str],
+        member_order: list[str],
+    ) -> None:
+        sequence = self.next_sequence()
+        source_terms, _ = self.endpoint_nodes(
+            edge.get_source(),
+            node_defaults,
+            edge_defaults,
+            members,
+            member_order,
+            sequence,
+        )
+        destination_terms, _ = self.endpoint_nodes(
+            edge.get_destination(),
+            node_defaults,
+            edge_defaults,
+            members,
+            member_order,
+            sequence,
+        )
+
+        for source in source_terms:
+            for destination in destination_terms:
+                source_id = _effective_node_id(source)
+                destination_id = _effective_node_id(destination)
+                key = self.edge_key(
+                    source_id,
+                    destination_id,
+                )
+
+                pair: tuple[str, str]
+                if self.graph_type == "graph":
+                    pair = cast(
+                        "tuple[str, str]",
+                        tuple(sorted((source_id, destination_id))),
+                    )
+                else:
+                    pair = source_id, destination_id
+                existing_edge = self.strict_edges.setdefault(key, {}).get(
+                    pair
+                )
+                if existing_edge is not None and self.strict:
+                    existing_edge.get_attributes().update(
+                        copy.deepcopy(edge.get_attributes())
+                    )
+                    continue
+
+                effective_edge = Edge(
+                    source,
+                    destination,
+                    **self.effective_attributes(
+                        edge_defaults, edge.get_attributes()
+                    ),
+                )
+                effective_edge.set_sequence(sequence)
+                edges_by_pair = self.strict_edges.setdefault(key, {})
+                graph.obj_dict["edges"].setdefault(
+                    (source, destination), []
+                ).append(effective_edge.obj_dict)
+                edges_by_pair[pair] = effective_edge
+                self.edge_objects.append(effective_edge)
+                self.add_members(
+                    (source_id, destination_id), members, member_order
+                )
+
+    def make_target_subgraph(self, source: Graph) -> Subgraph:
+        target = Subgraph(
+            source.get_name() or "",
+            suppress_disconnected=source.get_suppress_disconnected(),
+            simplify=source.get_simplify(),
+            **copy.deepcopy(source.get_attributes()),
+        )
+        target.obj_dict["show_keyword"] = source.obj_dict.get(
+            "show_keyword", True
+        )
+        return target
+
+    def process_scope(
+        self,
+        source: Graph,
+        target: Graph,
+        node_defaults: dict[str, Any],
+        edge_defaults: dict[str, Any],
+    ) -> tuple[str, ...]:
+        members: set[str] = set()
+        member_order: list[str] = []
+
+        for _, kind, item in self.ordered_events(source):
+            event_sequence: int | None = None
+            if kind == "node":
+                node = cast(Node, item)
+                if self.is_default_statement(node, "node"):
+                    node_defaults.update(
+                        copy.deepcopy(node.get_attributes())
+                    )
+                elif self.is_default_statement(node, "edge"):
+                    edge_defaults.update(
+                        copy.deepcopy(node.get_attributes())
+                    )
+                elif self.is_default_statement(node, "graph"):
+                    target.get_attributes().update(
+                        copy.deepcopy(node.get_attributes())
+                    )
+                else:
+                    event_sequence = self.next_sequence()
+                    self.add_node(
+                        target,
+                        node,
+                        node_defaults,
+                        members,
+                        member_order,
+                        sequence=event_sequence,
+                    )
+
+            elif kind == "edge":
+                self.add_edge(
+                    target,
+                    cast(Edge, item),
+                    node_defaults,
+                    edge_defaults,
+                    members,
+                    member_order,
+                )
+
+            else:
+                source_subgraph = cast(Subgraph, item)
+                target_subgraph = self.make_target_subgraph(source_subgraph)
+                target_subgraph.set_sequence(self.next_sequence())
+                child_members = self.process_scope(
+                    source_subgraph,
+                    target_subgraph,
+                    copy.deepcopy(node_defaults),
+                    copy.deepcopy(edge_defaults),
+                )
+                target.obj_dict["subgraphs"].setdefault(
+                    target_subgraph.get_name(), []
+                ).append(target_subgraph.obj_dict)
+                self.add_members(
+                    child_members, members, member_order
+                )
+
+        return tuple(member_order)
+
+    def build(self) -> Graph:
+        self.process_scope(self.source, self.target, {}, {})
+
+        self.target.obj_dict["nodes"] = {
+            name: [node.obj_dict] for name, node in self.nodes.items()
+        }
+        self.target.obj_dict["edges"] = {}
+        for edge in self.edge_objects:
+            points = (edge.get_source(), edge.get_destination())
+            self.target.obj_dict["edges"].setdefault(points, []).append(
+                edge.obj_dict
+            )
+
+        self.target.set_parent_graph(self.target)
+        return self.target
+
+
+def get_effective_graph(graph: Graph) -> Graph:
+    """Return nodes and edges after DOT defaults and strict edge rules."""
+    return _EffectiveGraphBuilder(graph).build()
+
+
 def __generate_attribute_methods(Klass: type[Common], attrs: set[str]) -> None:
     """Generate setter and getter methods for attributes."""
     for attr in attrs:
@@ -1147,6 +1545,15 @@ class Graph(Common):
         seq: int = self.obj_dict.get("current_child_sequence", 1)
         self.obj_dict["current_child_sequence"] = seq + 1
         return seq
+
+    @property
+    def effective_graph(self) -> Graph:
+        """Effective graph after applying scoped DOT defaults."""
+        return get_effective_graph(self)
+
+    def get_effective_graph(self) -> Graph:
+        """Return the effective graph as a new graph object."""
+        return get_effective_graph(self)
 
     def __enter__(self) -> Self:
         """Enter the runtime context for this graph.
