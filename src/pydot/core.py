@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 import pydot
 from pydot._vendor import tempfile
 from pydot.classes import AttributeDict, EdgeEndpoint, FrozenDict
+from pydot.layout import Hit, LayoutHitIndex
 
 _logger = logging.getLogger(__name__)
 _logger.debug("pydot core module initializing")
@@ -1757,6 +1758,52 @@ class Dot(Graph):
         the dot file into a graph.
         """
         self.prog = prog
+
+    def build_layout_hit_index(
+        self,
+        *,
+        scale: float | tuple[float, float] = 1.0,
+        translate: tuple[float, float] = (0.0, 0.0),
+        cell_size: float | None = None,
+    ) -> LayoutHitIndex:
+        """Build a spatial index from Graphviz ``pos`` attributes."""
+
+        return LayoutHitIndex(
+            self,
+            scale=scale,
+            translate=translate,
+            cell_size=cell_size,
+        )
+
+    def hit_at(
+        self,
+        x: float,
+        y: float,
+        *,
+        tolerance: float = 0.0,
+        scale: float | tuple[float, float] = 1.0,
+        translate: tuple[float, float] = (0.0, 0.0),
+    ) -> Hit | None:
+        """Return the closest laid-out object within ``tolerance``."""
+
+        return self.build_layout_hit_index(
+            scale=scale, translate=translate
+        ).hit(x, y, tolerance=tolerance)
+
+    def hits_at(
+        self,
+        x: float,
+        y: float,
+        *,
+        tolerance: float = 0.0,
+        scale: float | tuple[float, float] = 1.0,
+        translate: tuple[float, float] = (0.0, 0.0),
+    ) -> list[Hit]:
+        """Return all laid-out objects within ``tolerance``."""
+
+        return self.build_layout_hit_index(
+            scale=scale, translate=translate
+        ).hits(x, y, tolerance=tolerance)
 
     def write(
         self,

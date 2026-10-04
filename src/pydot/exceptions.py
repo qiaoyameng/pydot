@@ -28,3 +28,11 @@ class Error(PydotException):
 
     def __str__(self) -> str:
         return self.value
+
+
+class LayoutHitError(Error):
+    """Invalid or unsupported layout data used by a hit index."""
+
+    def __init__(self, value: str, target: object | None = None) -> None:
+        super().__init__(value)
+        self.target = target
