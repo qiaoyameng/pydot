@@ -9,7 +9,9 @@ Pydot versions since 1.4.2 adhere to [PEP 440-style semantic versioning]
 4.0.2 (unreleased)
 ------------------
 
-- Nothing changed yet.
+Added:
+- Added a finite rank-constraint checker for `rank=same` groups and
+  non-negative edge `minlen` values in directed graphs.
 
 
 4.0.1 (2025-06-17)

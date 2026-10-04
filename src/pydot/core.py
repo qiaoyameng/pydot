@@ -15,7 +15,17 @@ import re
 import subprocess
 import sys
 import warnings
-from typing import TYPE_CHECKING, Any, Final, Sequence, Union, cast
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Sequence,
+    Union,
+    cast,
+)
 
 if TYPE_CHECKING:
     # `typing_extensions` is always available in `TYPE_CHECKING` blocks,
@@ -959,6 +969,103 @@ class Edge(Common):
 __generate_attribute_methods(Edge, EDGE_ATTRIBUTES)
 
 
+@dataclass(frozen=True)
+class RankConstraint:
+    """A same-rank equality or directed minimum-rank-gap constraint."""
+
+    kind: str
+    source: str
+    destination: str
+    min_rank_gap: int
+    declaration: int
+    subgraph: str | None = None
+    sequence: int | None = None
+    edge: Edge | None = None
+    nodes: tuple[str, ...] | None = None
+    reversed_constraint: bool = False
+
+    @property
+    def difference(self) -> int:
+        return self.min_rank_gap
+
+    def __str__(self) -> str:
+        if self.kind == "edge":
+            return (
+                f"edge #{self.declaration} {self.source} -> "
+                f"{self.destination} [minlen={self.min_rank_gap}]"
+            )
+        return (
+            f"rank=same declaration #{self.declaration}: "
+            f"{self.source} = {self.destination}"
+        )
+
+
+@dataclass(frozen=True)
+class RankConstraintConflict:
+    """A positive cycle proving that rank constraints are incompatible."""
+
+    constraints: tuple[RankConstraint, ...]
+    steps: tuple[RankConstraint, ...]
+
+    def __str__(self) -> str:
+        return " -> ".join(self._format_step(step) for step in self.steps)
+
+    @property
+    def cycle(self) -> tuple[RankConstraint, ...]:
+        return self.steps
+
+    @property
+    def chain(self) -> tuple[RankConstraint, ...]:
+        return self.steps
+
+    @staticmethod
+    def _format_step(step: RankConstraint) -> str:
+        if step.kind == "same":
+            relation = "="
+        else:
+            relation = "->"
+        return (
+            f"{step.source} {relation} {step.destination}"
+            f" ({step.min_rank_gap:+d})"
+        )
+
+
+@dataclass(frozen=True)
+class UnsupportedRankFeature:
+    """Rank-related syntax that this finite checker does not implement."""
+
+    feature: str
+    message: str
+    declaration: int | None = None
+
+
+@dataclass(frozen=True)
+class RankConstraintCheck:
+    """Result of checking finite rank equality and minlen constraints."""
+
+    feasible: bool | None
+    ranks: Mapping[str, int]
+    constraints: tuple[RankConstraint, ...]
+    conflicts: tuple[RankConstraintConflict, ...]
+    unsupported: tuple[UnsupportedRankFeature, ...]
+
+    @property
+    def layers(self) -> Mapping[str, int]:
+        return self.ranks
+
+    @property
+    def status(self) -> str:
+        if self.unsupported:
+            return "unsupported"
+        if self.feasible:
+            return "feasible"
+        return "infeasible"
+
+    @property
+    def conflict(self) -> RankConstraintConflict | None:
+        return self.conflicts[0] if self.conflicts else None
+
+
 class Graph(Common):
     """Class representing a graph in Graphviz's dot language.
 
@@ -1449,6 +1556,15 @@ class Graph(Common):
             )
 
         return sgraph_objs
+
+    def check_rank_constraints(self) -> RankConstraintCheck:
+        """Check rank=same groups and enabled edge minlen constraints.
+
+        The checker handles finite constraints in directed graphs. It
+        returns integer ranks when feasible, a positive constraint cycle
+        when infeasible, and explicitly records unsupported rank syntax.
+        """
+        return check_rank_constraints(self)
 
     def set_parent_graph(self, parent_graph: Common | None) -> None:
         self.obj_dict["parent_graph"] = parent_graph
@@ -1988,3 +2104,598 @@ __generate_format_methods(Dot)
 
 # Type alias for forward-referenced type
 EdgeDefinition: TypeAlias = Union[EdgeEndpoint, Node, Subgraph, Cluster]
+
+
+_TRUE_VALUES: Final = frozenset(("true", "yes", "on", "1"))
+_FALSE_VALUES: Final = frozenset(("false", "no", "off", "0"))
+
+
+class _RankDSU:
+    def __init__(self, nodes: set[str]) -> None:
+        self.parent = {node: node for node in nodes}
+        self.rank = {node: 0 for node in nodes}
+
+    def find(self, node: str) -> str:
+        parent = self.parent[node]
+        if parent != node:
+            parent = self.find(parent)
+            self.parent[node] = parent
+        return parent
+
+    def union(self, first: str, second: str) -> None:
+        first_root = self.find(first)
+        second_root = self.find(second)
+        if first_root == second_root:
+            return
+        if self.rank[first_root] < self.rank[second_root]:
+            first_root, second_root = second_root, first_root
+        self.parent[second_root] = first_root
+        if self.rank[first_root] == self.rank[second_root]:
+            self.rank[first_root] += 1
+
+
+def _rank_attribute(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        result = value
+        if len(result) >= 2 and result[0] == '"' and result[-1] == '"':
+            result = result[1:-1]
+        return result.strip().lower()
+    return str(value).strip().lower()
+
+
+def _constraint_enabled(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+    elif isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_VALUES:
+            return True
+        if token in _FALSE_VALUES:
+            return False
+    raise pydot.Error("Edge constraint must be a boolean value.")
+
+
+def _non_negative_minlen(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise pydot.Error("Edge minlen must be a non-negative integer.")
+    try:
+        result = int(value, 10) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise pydot.Error(
+            "Edge minlen must be a non-negative integer."
+        ) from exc
+    if result < 0:
+        raise pydot.Error(
+            "Edge minlen must be a non-negative integer, not negative."
+        )
+    return result
+
+
+def _endpoint_name(endpoint: EdgeEndpoint) -> str | None:
+    if isinstance(endpoint, (int, float)):
+        return str(endpoint)
+    if not isinstance(endpoint, str):
+        return None
+    if endpoint.startswith("<") and endpoint.endswith(">"):
+        return endpoint
+    if endpoint.startswith('"'):
+        closing_quote = endpoint.find('"', 1)
+        if closing_quote < 0:
+            return None
+        if closing_quote == len(endpoint) - 1:
+            return endpoint
+        if endpoint[closing_quote + 1 : closing_quote + 2] != ":":
+            return None
+        return endpoint[: closing_quote + 1]
+    return endpoint.split(":", 1)[0]
+
+
+def _is_default_node(name: str) -> bool:
+    return name in ("graph", "node", "edge")
+
+
+def _statement_order(obj: Common) -> int:
+    sequence = obj.get_sequence()
+    return sequence if sequence is not None else 10**12
+
+
+@dataclass(frozen=True)
+class _EdgeRecord:
+    declaration: int
+    edge: Edge
+    constraint: Any
+    minlen: Any
+    lhead: Any
+    ltail: Any
+
+
+def _collect_rank_data(
+    current_graph: Graph,
+    nodes: set[str],
+    edge_records: list[_EdgeRecord],
+    same_groups: list[tuple[int, Subgraph, tuple[str, ...]]],
+    unsupported: list[UnsupportedRankFeature],
+    edge_defaults: Mapping[str, Any] | None = None,
+    declaration: int = 0,
+) -> int:
+    current_edge_defaults = dict(edge_defaults or {})
+    graph_attributes = current_graph.get_attributes()
+    if _rank_attribute(graph_attributes.get("newrank")) == "true":
+        unsupported.append(
+            UnsupportedRankFeature(
+                "newrank",
+                "newrank=true rank placement is unsupported.",
+                current_graph.get_sequence(),
+            )
+        )
+    if _rank_attribute(graph_attributes.get("clusterrank")) == "global":
+        unsupported.append(
+            UnsupportedRankFeature(
+                "clusterrank-global",
+                "clusterrank=global rank placement is unsupported.",
+                current_graph.get_sequence(),
+            )
+        )
+    children: list[tuple[int, str, Common]] = []
+    children.extend(
+        (_statement_order(node_item), "node", node_item)
+        for node_item in current_graph.get_node_list()
+    )
+    children.extend(
+        (_statement_order(edge_item), "edge", edge_item)
+        for edge_item in current_graph.get_edge_list()
+    )
+    children.extend(
+        (_statement_order(sgraph_item), "subgraph", sgraph_item)
+        for sgraph_item in current_graph.get_subgraph_list()
+    )
+    children.sort(key=lambda item: (item[0], item[1]))
+
+    for _, kind, child in children:
+        declaration += 1
+        if kind == "node":
+            node = cast(Node, child)
+            name = node.get_name()
+            if _is_default_node(name):
+                if "rank" in node.get_attributes():
+                    unsupported.append(
+                        UnsupportedRankFeature(
+                            "default-rank",
+                            "rank on graph/node/edge defaults is "
+                            "unsupported.",
+                            declaration,
+                        )
+                    )
+                if name == "edge":
+                    for attr_name in (
+                        "constraint",
+                        "minlen",
+                        "lhead",
+                        "ltail",
+                    ):
+                        if attr_name in node.get_attributes():
+                            current_edge_defaults[attr_name] = node.get(
+                                attr_name
+                            )
+                continue
+
+            if "rank" in node.get_attributes():
+                unsupported.append(
+                    UnsupportedRankFeature(
+                        "node-rank",
+                        f'Node {name} has unsupported rank attribute '
+                        f'"{node.get("rank")}".',
+                        declaration,
+                    )
+                )
+            nodes.add(name)
+
+        elif kind == "edge":
+            edge = cast(Edge, child)
+            attributes = edge.get_attributes()
+
+            def default_attr(attr_name: str) -> Any:
+                return attributes.get(
+                    attr_name, current_edge_defaults.get(attr_name)
+                )
+
+            edge_records.append(
+                _EdgeRecord(
+                    declaration=declaration,
+                    edge=edge,
+                    constraint=default_attr("constraint"),
+                    minlen=default_attr("minlen"),
+                    lhead=default_attr("lhead"),
+                    ltail=default_attr("ltail"),
+                )
+            )
+            continue
+
+        elif kind == "subgraph":
+            child_graph = cast(Subgraph, child)
+            rank = _rank_attribute(child_graph.get("rank"))
+            if rank is not None and rank != "same":
+                unsupported.append(
+                    UnsupportedRankFeature(
+                        "rank",
+                        f'Rank value rank="{rank}" is unsupported; only '
+                        "rank=same is checked.",
+                        declaration,
+                    )
+                )
+            elif rank == "same":
+                group_nodes = []
+                for group_node in child_graph.get_node_list():
+                    name = _endpoint_name(group_node.get_name())
+                    if name is None:
+                        unsupported.append(
+                            UnsupportedRankFeature(
+                                "subgraph-rank-node",
+                                "Subgraphs may not be members of rank=same "
+                                "groups.",
+                                declaration,
+                            )
+                        )
+                    elif _is_default_node(name):
+                        continue
+                    else:
+                        group_nodes.append(name)
+                        nodes.add(name)
+                if child_graph.get_subgraph_list():
+                    unsupported.append(
+                        UnsupportedRankFeature(
+                            "nested-rank-group",
+                            "Nested subgraphs inside a rank=same group "
+                            "are unsupported.",
+                            declaration,
+                        )
+                    )
+                same_groups.append(
+                    (declaration, child_graph, tuple(group_nodes))
+                )
+            declaration = _collect_rank_data(
+                child_graph,
+                nodes,
+                edge_records,
+                same_groups,
+                unsupported,
+                current_edge_defaults,
+                declaration,
+            )
+
+    return declaration
+
+
+def _same_constraint(
+    declaration: int,
+    sgraph: Subgraph,
+    source: str,
+    destination: str,
+    group_nodes: tuple[str, ...],
+) -> RankConstraint:
+    return RankConstraint(
+        kind="same",
+        source=source,
+        destination=destination,
+        min_rank_gap=0,
+        declaration=declaration,
+        subgraph=sgraph.get_name() or None,
+        sequence=sgraph.get_sequence(),
+        nodes=group_nodes,
+    )
+
+
+def _build_rank_constraints(
+    nodes: set[str],
+    edge_records: list[_EdgeRecord],
+    same_groups: list[tuple[int, Subgraph, tuple[str, ...]]],
+    unsupported: list[UnsupportedRankFeature],
+) -> tuple[list[RankConstraint], list[RankConstraint]]:
+    constraints: list[RankConstraint] = []
+    edge_constraints: list[RankConstraint] = []
+
+    for declaration, sgraph, group_nodes in same_groups:
+        for source, destination in zip(group_nodes, group_nodes[1:]):
+            constraint = _same_constraint(
+                declaration, sgraph, source, destination, group_nodes
+            )
+            constraints.append(constraint)
+
+    for record in edge_records:
+        declaration = record.declaration
+        edge = record.edge
+        enabled = _constraint_enabled(record.constraint)
+        if "rank" in edge.get_attributes():
+            unsupported.append(
+                UnsupportedRankFeature(
+                    "edge-rank",
+                    "rank on an edge is unsupported.",
+                    declaration,
+                )
+            )
+
+        source = _endpoint_name(edge.get_source())
+        destination = _endpoint_name(edge.get_destination())
+        if source is None or destination is None:
+            if enabled:
+                unsupported.append(
+                    UnsupportedRankFeature(
+                        "subgraph-endpoint",
+                        "Edges connected to subgraph endpoints are "
+                        "unsupported.",
+                        declaration,
+                    )
+                )
+            continue
+
+        nodes.add(source)
+        nodes.add(destination)
+
+        if not enabled:
+            continue
+
+        if record.lhead is not None or record.ltail is not None:
+            unsupported.append(
+                UnsupportedRankFeature(
+                    "compound-endpoint",
+                    "Edges constrained through lhead/ltail are unsupported.",
+                    declaration,
+                )
+            )
+            continue
+
+        minlen = _non_negative_minlen(
+            record.minlen if record.minlen is not None else 1
+        )
+        constraint = RankConstraint(
+            kind="edge",
+            source=source,
+            destination=destination,
+            min_rank_gap=minlen,
+            declaration=declaration,
+            sequence=edge.get_sequence(),
+            edge=edge,
+        )
+        constraints.append(constraint)
+        edge_constraints.append(constraint)
+
+    return constraints, edge_constraints
+
+
+def _positive_cycle(
+    nodes: list[str], arcs: list[tuple[str, str, RankConstraint, bool]]
+) -> RankConstraintConflict | None:
+    distances = {node: 0 for node in nodes}
+    predecessors: dict[str, tuple[str, RankConstraint, bool]] = {}
+    changed: set[str] = set()
+
+    for _ in range(len(nodes)):
+        changed.clear()
+        for source, destination, constraint, reversed_constraint in arcs:
+            candidate = distances[source] + constraint.min_rank_gap
+            if candidate > distances[destination]:
+                distances[destination] = candidate
+                predecessors[destination] = (
+                    source,
+                    constraint,
+                    reversed_constraint,
+                )
+                changed.add(destination)
+        if not changed:
+            return None
+
+    for node in nodes:
+        if node not in changed:
+            continue
+        path: list[tuple[str, RankConstraint, bool]] = []
+        current = node
+        seen: dict[str, int] = {}
+        while current not in seen:
+            seen[current] = len(path)
+            if current not in predecessors:
+                break
+            previous, constraint, reversed_constraint = predecessors[current]
+            path.append((current, constraint, reversed_constraint))
+            current = previous
+        else:
+            cycle = path[seen[current] :]
+            steps: list[RankConstraint] = []
+            used: list[RankConstraint] = []
+
+            indexed_cycle = enumerate(cycle)
+            for index, (
+                endpoint,
+                constraint,
+                reversed_constraint,
+            ) in indexed_cycle:
+                previous = (
+                    current
+                    if index == len(cycle) - 1
+                    else cycle[index + 1][0]
+                )
+                if reversed_constraint:
+                    source = constraint.destination
+                    destination = constraint.source
+                else:
+                    source = constraint.source
+                    destination = constraint.destination
+                if (source, destination) != (previous, endpoint):
+                    break
+                step = RankConstraint(
+                    kind=constraint.kind,
+                    source=source,
+                    destination=destination,
+                    min_rank_gap=constraint.min_rank_gap,
+                    declaration=constraint.declaration,
+                    subgraph=constraint.subgraph,
+                    sequence=constraint.sequence,
+                    edge=constraint.edge,
+                    nodes=constraint.nodes,
+                    reversed_constraint=reversed_constraint,
+                )
+                steps.insert(0, step)
+                used.append(constraint)
+            else:
+                if sum(step.min_rank_gap for step in steps) > 0:
+                    return RankConstraintConflict(
+                        constraints=tuple(dict.fromkeys(used)),
+                        steps=tuple(steps),
+                    )
+    return None
+
+
+def check_rank_constraints(graph: Graph) -> RankConstraintCheck:
+    """Check finite same-rank and non-negative edge minlen constraints."""
+
+    if not isinstance(graph, Graph):
+        raise TypeError("check_rank_constraints() requires a pydot.Graph.")
+    if graph.get_graph_type() != "digraph":
+        return RankConstraintCheck(
+            feasible=None,
+            ranks=MappingProxyType({}),
+            constraints=(),
+            conflicts=(),
+            unsupported=(
+                UnsupportedRankFeature(
+                    "graph-type",
+                    "Rank constraint checking only supports directed graphs.",
+                    None,
+                ),
+            ),
+        )
+
+    root_rank = _rank_attribute(graph.get("rank"))
+    unsupported = []
+    if root_rank is not None:
+        unsupported.append(
+            UnsupportedRankFeature(
+                "graph-rank",
+                "rank on the root graph is unsupported; only rank=same "
+                "subgraphs are checked.",
+                graph.get_sequence(),
+            )
+        )
+
+    nodes: set[str] = set()
+    edge_records: list[_EdgeRecord] = []
+    same_groups: list[tuple[int, Subgraph, tuple[str, ...]]] = []
+    _collect_rank_data(
+        graph,
+        nodes,
+        edge_records,
+        same_groups,
+        unsupported,
+    )
+    constraints, edge_constraints = _build_rank_constraints(
+        nodes, edge_records, same_groups, unsupported
+    )
+
+    unique_unsupported = tuple(
+        {
+            (
+                item.feature,
+                item.message,
+                item.declaration,
+            ): item
+            for item in unsupported
+        }.values()
+    )
+    if unsupported:
+        return RankConstraintCheck(
+            feasible=None,
+            ranks=MappingProxyType({}),
+            constraints=(),
+            conflicts=(),
+            unsupported=unique_unsupported,
+        )
+
+    dsu = _RankDSU(nodes)
+    arcs: list[tuple[str, str, RankConstraint, bool]] = []
+    for constraint in constraints:
+        if constraint.kind == "same":
+            dsu.union(constraint.source, constraint.destination)
+            arcs.append(
+                (
+                    constraint.source,
+                    constraint.destination,
+                    constraint,
+                    False,
+                )
+            )
+            arcs.append(
+                (
+                    constraint.destination,
+                    constraint.source,
+                    constraint,
+                    True,
+                )
+            )
+        else:
+            arcs.append(
+                (
+                    constraint.source,
+                    constraint.destination,
+                    constraint,
+                    False,
+                )
+            )
+
+    ordered_nodes = sorted(nodes)
+    conflict = _positive_cycle(ordered_nodes, arcs)
+    if conflict is not None:
+        return RankConstraintCheck(
+            feasible=False,
+            ranks=MappingProxyType({}),
+            constraints=tuple(constraints),
+            conflicts=(conflict,),
+            unsupported=(),
+        )
+
+    components: dict[str, list[str]] = {}
+    for node in ordered_nodes:
+        components.setdefault(dsu.find(node), []).append(node)
+    component_arcs: dict[str, list[tuple[str, int]]] = {
+        root: [] for root in components
+    }
+    for constraint in edge_constraints:
+        source_root = dsu.find(constraint.source)
+        destination_root = dsu.find(constraint.destination)
+        component_arcs[source_root].append(
+            (destination_root, constraint.min_rank_gap)
+        )
+
+    component_ranks = {root: 0 for root in components}
+    for _ in range(len(components)):
+        changed = False
+        for source, outgoing in component_arcs.items():
+            for destination, min_rank_gap in outgoing:
+                candidate = component_ranks[source] + min_rank_gap
+                if candidate > component_ranks[destination]:
+                    component_ranks[destination] = candidate
+                    changed = True
+        if not changed:
+            break
+
+    ranks = {
+        node: component_ranks[dsu.find(node)]
+        for node in ordered_nodes
+    }
+    return RankConstraintCheck(
+        feasible=True,
+        ranks=MappingProxyType(ranks),
+        constraints=tuple(constraints),
+        conflicts=(),
+        unsupported=(),
+    )
+
+RankConstraintResult = RankConstraintCheck
+check_rank_constraint = check_rank_constraints

@@ -158,6 +158,23 @@ graph.set_bgcolor("lightyellow")
 graph.get_node("b")[0].set_shape("box")
 ```
 
+Check finite `rank=same` and edge `minlen` constraints before layout:
+
+```python
+result = graph.check_rank_constraints()
+
+if result.status == "feasible":
+    ranks = result.ranks
+elif result.status == "infeasible":
+    cycle = result.conflicts[0].steps
+elif result.status == "unsupported":
+    print(result.unsupported)
+```
+
+The infeasible result contains a closed chain of constraints whose minimum
+rank differences sum to a positive value. Unimplemented rank semantics are
+reported instead of guessed.
+
 ### 3. Output
 
 Here are four different output options:
