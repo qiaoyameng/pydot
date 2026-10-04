@@ -1468,6 +1468,29 @@ class Graph(Common):
             for obj in obj_list:
                 Graph(obj_dict=obj).set_parent_graph(parent_graph)
 
+    def contract_nodes(
+        self,
+        groups: Any,
+        attribute_reducer: Any = None,
+        merge_parallel_edges: bool = False,
+        self_loops: str = "keep",
+        port_mapping: Any = None,
+    ) -> Any:
+        """Contract non-overlapping node groups and preserve provenance.
+
+        See :func:`pydot.contract_nodes` for details.
+        """
+        from pydot.contraction import contract_nodes
+
+        return contract_nodes(
+            self,
+            groups,
+            attribute_reducer=attribute_reducer,
+            merge_parallel_edges=merge_parallel_edges,
+            self_loops=self_loops,
+            port_mapping=port_mapping,
+        )
+
     def to_string(
         self, indent: Any = "", indent_level: int = 0, inline: bool = False
     ) -> str:

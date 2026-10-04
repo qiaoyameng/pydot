@@ -19,3 +19,4 @@ _logger.debug("pydot %s", __version__)
 from pydot.classes import FrozenDict  # noqa: F401, E402
 from pydot.core import *  # noqa: F403, E402
 from pydot.exceptions import *  # noqa: E402, F403
+from pydot.contraction import *  # noqa: F403, E402
