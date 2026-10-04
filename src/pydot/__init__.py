@@ -18,4 +18,5 @@ _logger.debug("pydot %s", __version__)
 
 from pydot.classes import FrozenDict  # noqa: F401, E402
 from pydot.core import *  # noqa: F403, E402
+from pydot.effective import EffectiveGraph, effective_graph  # noqa: E402, F401
 from pydot.exceptions import *  # noqa: E402, F403

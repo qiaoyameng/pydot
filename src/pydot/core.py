@@ -1434,6 +1434,18 @@ class Graph(Common):
     def get_subgraphs(self) -> list[Subgraph]:
         return self.get_subgraph_list()
 
+    def effective_graph(self) -> "pydot.effective.EffectiveGraph":
+        """Compute the effective (resolved) view of this graph.
+
+        Resolves graph/node/edge default scopes in declaration order,
+        implicitly creates nodes referenced by edge statements, expands
+        subgraph edge endpoints and merges duplicate edges in strict
+        graphs. The declaration tree of this graph is not modified.
+        """
+        from pydot.effective import effective_graph as _effective_graph
+
+        return _effective_graph(self)
+
     def get_subgraph_list(self) -> list[Subgraph]:
         """Get the list of Subgraph instances.
 

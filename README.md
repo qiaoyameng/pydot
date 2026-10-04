@@ -158,6 +158,31 @@ graph.set_bgcolor("lightyellow")
 graph.get_node("b")[0].set_shape("box")
 ```
 
+#### Resolve the effective graph
+
+`Node.get_attributes()` only returns the attributes written on that
+specific statement; it misses attributes inherited from `node [...]` /
+`edge [...]` defaults and nodes created implicitly by an edge
+statement. `effective_graph()` computes the graph as Graphviz sees it,
+walking the DOT source in declaration order:
+
+```python
+view = graph.effective_graph()          # or pydot.effective_graph(graph)
+
+for node in view.get_nodes():           # implicit edge endpoints included
+    print(node.get_name(), node.get("shape"), node.get("color"))
+
+for edge in view.get_edges():
+    print(edge.get_source(), edge.get_destination(), edge.get_attributes())
+```
+
+The view handles default-value scopes (later `node [...]` /
+`edge [...]` changes never reach objects created earlier or leak out of
+a subgraph), cross-subgraph node restatements, subgraph edge-endpoint
+expansion and strict duplicate-edge merging (including `a -- b` vs.
+`b -- a` in undirected graphs). The original graph is not modified;
+subgraphs are available through `view.get_subgraphs()`.
+
 ### 3. Output
 
 Here are four different output options:

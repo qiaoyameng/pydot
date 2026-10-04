@@ -9,7 +9,17 @@ Pydot versions since 1.4.2 adhere to [PEP 440-style semantic versioning]
 4.0.2 (unreleased)
 ------------------
 
-- Nothing changed yet.
+Added:
+- Effective graph view: `Graph.effective_graph()` /
+  `pydot.effective_graph()` returns a resolved view that computes the
+  real nodes, edges and attributes in DOT declaration order. It applies
+  graph/node/edge default scopes (without retroactively changing
+  already-created objects or leaking subgraph defaults), materializes
+  nodes implicitly created by edge statements, restates nodes across
+  subgraphs, expands subgraph edge endpoints to node combinations and
+  merges duplicate edges in strict graphs (including reverse
+  duplicates in undirected graphs). The original declaration tree is
+  preserved.
 
 
 4.0.1 (2025-06-17)
