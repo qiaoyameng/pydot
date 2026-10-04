@@ -158,6 +158,39 @@ graph.set_bgcolor("lightyellow")
 graph.get_node("b")[0].set_shape("box")
 ```
 
+#### Check rank constraints before layout
+
+For directed graphs, pydot can check a finite subset of the rank
+semantics without running a layout engine: `rank="same"` groups and
+non-negative edge `minlen` constraints (edges with
+`constraint=false` are ignored, and endpoints not declared as nodes are
+treated as implicit nodes).
+
+```python
+result = pydot.check_rank_constraints(graph)
+# or: graph.check_rank_constraints()
+
+if result.status is pydot.ConstraintStatus.FEASIBLE:
+    print(result.layers)  # {'a': 0, 'b': 1, ...} integer layer numbers
+elif result.status is pydot.ConstraintStatus.INFEASIBLE:
+    for conflict in result.conflicts:
+        print(conflict)  # positive-weight cycle proving contradiction
+else:  # ConstraintStatus.UNSUPPORTED
+    for item in result.unsupported:
+        print(item.detail)  # rank=min, undirected graph, lhead, ...
+```
+
+Every `LayerConstraint` in `result.constraints` keeps the identity of
+its declaring edge (`edge_index`, and the DOT `id` if present), so
+parallel edges can be told apart. Each `ConflictChain` is a closed
+chain whose steps sum to a strictly positive required layer
+difference; it can be checked independently against the constraints in
+`result.constraints` and `result.same_rank_groups`. The returned
+assignment is any integer solution; it does not reproduce Graphviz's
+visual result. Rank semantics other than `same` (`min`, `source`,
+`max`, `sink`), undirected graphs and `lhead`/`ltail` endpoints are
+reported as unsupported instead of being guessed at.
+
 ### 3. Output
 
 Here are four different output options:

@@ -1450,6 +1450,18 @@ class Graph(Common):
 
         return sgraph_objs
 
+    def check_rank_constraints(self) -> "pydot.RankAssignmentResult":
+        """Check finite ``rank``/``minlen`` constraints on this graph.
+
+        Delegates to :func:`pydot.check_rank_constraints`; see that
+        function for the supported rank semantics and the result
+        object.
+        """
+
+        from pydot.ranking import check_rank_constraints
+
+        return check_rank_constraints(self)
+
     def set_parent_graph(self, parent_graph: Common | None) -> None:
         self.obj_dict["parent_graph"] = parent_graph
 
