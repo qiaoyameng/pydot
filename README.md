@@ -234,6 +234,35 @@ methods. For example, `help(pydot)`, `help(pydot.Graph)` and
 
 More [documentation contributions welcome][contrib].
 
+### Record-shaped labels
+
+Nodes with shape `record` or `Mrecord` use a small label language with
+field separators (`|`), groups (`{ }`) and port declarations (`<id>`).
+`pydot.RecordLabel` parses those labels into a nested field tree, builds
+them back from Python data, derives the layout direction of each level
+from `rankdir`, and validates port usage:
+
+```python
+import pydot
+
+label = pydot.RecordLabel.parse("{<id> id|name|{first|last}}")
+label.ports()            # {'id'}
+label.level_directions("TB")  # ['TB', 'LR']
+
+built = pydot.RecordLabel.build(
+    ["id", ("<name>", "name"), ["first", "last"]]
+)
+built.serialize()        # 'id|<name> name|{first|last}'
+
+graph = pydot.Dot(rankdir="LR")
+graph.add_node(pydot.Node("t", shape="record",
+                          label="{<id> id|{first|last}}"))
+graph.add_edge(pydot.Edge("t:id", "other"))
+graph.check_records()    # raises on bad syntax, duplicate or unknown ports
+```
+
+Plain string labels of non-record nodes are left untouched.
+
 ## Troubleshooting
 
 ### Enable logging

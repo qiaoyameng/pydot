@@ -25,6 +25,12 @@ if TYPE_CHECKING:
 import pydot
 from pydot._vendor import tempfile
 from pydot.classes import AttributeDict, EdgeEndpoint, FrozenDict
+from pydot.records import (
+    RecordLabel,
+    check_graph_records,
+    get_node_record,
+    is_record_node,
+)
 
 _logger = logging.getLogger(__name__)
 _logger.debug("pydot core module initializing")
@@ -731,6 +737,18 @@ class Node(Common):
         """Get the node's port."""
         return self.obj_dict["port"]  # type: ignore
 
+    def is_record(self) -> bool:
+        """Whether this node uses the ``record``/``Mrecord`` syntax."""
+        return is_record_node(self)
+
+    def get_record_label(self) -> RecordLabel | None:
+        """Parse the node's label as a record label.
+
+        Returns ``None`` for non-record nodes, HTML-like labels and
+        nodes without a label.
+        """
+        return get_node_record(self)
+
     def add_style(self, style: str) -> None:
         styles = self.obj_dict["attributes"].get("style", None)
         if not styles and style:
@@ -1388,6 +1406,16 @@ class Graph(Common):
             edge_objs.extend([Edge(obj_dict=obj_d) for obj_d in obj_dict_list])
 
         return edge_objs
+
+    def check_records(self) -> None:
+        """Validate record labels and edge port references.
+
+        Checks only nodes declared with shape ``record`` or
+        ``Mrecord``: raises on malformed labels, duplicate port
+        declarations within one node and edges referencing ports that
+        the target node does not declare.
+        """
+        check_graph_records(self)
 
     def add_subgraph(self, sgraph: Subgraph) -> None:
         """Adds a subgraph object to the graph.
