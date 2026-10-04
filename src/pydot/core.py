@@ -402,6 +402,190 @@ def quote_attr_if_necessary(s: str) -> str:
     return make_quoted(s)
 
 
+_ESC_ALIGNMENTS: Final = {"n": "center", "l": "left", "r": "right"}
+
+_ESC_PLACEHOLDERS: Final = frozenset("NGETH")
+
+_RECORD_SHAPES: Final = frozenset({"record", "Mrecord"})
+
+
+class LineBreak:
+    """A line break in an interpreted escString label.
+
+    Produced by the ``\\n``, ``\\l`` and ``\\r`` escapes, with
+    ``alignment`` being ``"center"``, ``"left"`` or ``"right"``
+    respectively.
+    """
+
+    def __init__(self, alignment: str = "center") -> None:
+        if alignment not in ("left", "center", "right"):
+            raise ValueError(f"Invalid line break alignment: {alignment!r}")
+        self.alignment = alignment
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, LineBreak):
+            return self.alignment == other.alignment
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((LineBreak, self.alignment))
+
+    def __repr__(self) -> str:
+        return f"LineBreak({self.alignment!r})"
+
+
+EscStringFragment = Union[str, LineBreak]
+
+
+def _esc_string_graph(obj: Common) -> Graph | None:
+    """Find the graph providing the ``\\G`` context for `obj`."""
+    if isinstance(obj, Graph):
+        return obj
+    graph = obj.get_parent_graph()
+    while graph is not None:
+        parent = graph.get_parent_graph()
+        if parent is None or parent is graph:
+            return graph
+        graph = parent
+    return None
+
+
+def _esc_string_name(name: Any) -> str:
+    """Render a stored object name as text, without DOT quoting."""
+    text = str(name)
+    if re_dbl_quoted.match(text):
+        return text[1:-1]
+    return text
+
+
+def _esc_string_placeholder(char: str, obj: Common | None) -> str | None:
+    """Resolve a ``\\X`` object placeholder.
+
+    Returns None when the placeholder does not apply to `obj`.
+    """
+    if obj is None:
+        return None
+    if char == "N":
+        if isinstance(obj, Node):
+            return _esc_string_name(obj.get_name())
+        return None
+    if char == "G":
+        graph = _esc_string_graph(obj)
+        if graph is None:
+            return None
+        name = graph.get_name()
+        # Anonymous graphs have no name to substitute.
+        return "" if name is None else _esc_string_name(name)
+    if char == "E":
+        if isinstance(obj, Edge):
+            src = _esc_string_name(obj.get_source())
+            dst = _esc_string_name(obj.get_destination())
+            op = "->" if obj.get_top_graph_type() == "digraph" else "--"
+            return f"{src}{op}{dst}"
+        return None
+    if char == "T":
+        if isinstance(obj, Edge):
+            return _esc_string_name(obj.get_source())
+        return None
+    if char == "H":
+        if isinstance(obj, Edge):
+            return _esc_string_name(obj.get_destination())
+        return None
+    return None
+
+
+def _is_record_label(text: str, obj: Common | None) -> bool:
+    """Check whether `text` uses record label syntax."""
+    if text.startswith("{"):
+        return True
+    if isinstance(obj, Node):
+        shape = obj.get("shape")
+        if isinstance(shape, str) and shape.strip('"') in _RECORD_SHAPES:
+            return True
+    return False
+
+
+def interpret_esc_string(
+    label: str, obj: Common | None = None
+) -> list[EscStringFragment]:
+    """Interpret a DOT escString label as text fragments and line breaks.
+
+    `label` is the raw attribute value as stored on the object; one
+    layer of surrounding double quotes, as kept by the DOT parser, is
+    removed first. `obj` is the graph, node or edge the label belongs
+    to and provides the context for the object placeholders:
+
+    - ``\\N``: node name (node labels only)
+    - ``\\G``: name of the graph containing the object, or of the
+      graph itself; empty for anonymous graphs
+    - ``\\E``: edge name, ``tail->head`` or ``tail--head`` depending
+      on the graph type (edge labels only)
+    - ``\\T``, ``\\H``: tail/head endpoints of an edge, including
+      ports as written (edge labels only)
+
+    ``\\n``, ``\\l`` and ``\\r`` become `LineBreak` fragments with
+    ``"center"``, ``"left"`` and ``"right"`` alignment. ``\\\\``
+    yields a literal backslash and takes precedence over the
+    placeholders, so ``\\\\N`` is the literal text ``\\N``.
+    Placeholders that do not apply to `obj` are kept literally. Any
+    other escaped character loses its backslash.
+
+    Substitution happens in a single pass: replacement text (such as
+    a node name containing a backslash) is never interpreted again.
+
+    HTML-like labels (``<...>``) and record labels (a leading ``{``,
+    or a node with shape ``record``/``Mrecord``) follow different
+    syntax rules and are returned verbatim as a single text fragment.
+
+    The interpretation is read-only: the stored attribute value used
+    for DOT serialization is never modified.
+    """
+    text = label
+    if re_dbl_quoted.match(text):
+        text = text[1:-1]
+    if re_html.match(text) or _is_record_label(text, obj):
+        return [text]
+
+    fragments: list[EscStringFragment] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            fragments.append("".join(current))
+            current.clear()
+
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char != "\\":
+            current.append(char)
+            i += 1
+            continue
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if not nxt:
+            current.append("\\")
+            i += 1
+        elif nxt == "\\":
+            current.append("\\")
+            i += 2
+        elif nxt in _ESC_ALIGNMENTS:
+            flush()
+            fragments.append(LineBreak(_ESC_ALIGNMENTS[nxt]))
+            i += 2
+        elif nxt in _ESC_PLACEHOLDERS:
+            replacement = _esc_string_placeholder(nxt, obj)
+            if replacement is None:
+                current.append("\\" + nxt)
+            else:
+                current.append(replacement)
+            i += 2
+        else:
+            current.append(nxt)
+            i += 2
+    flush()
+    return fragments
+
+
 def graph_from_dot_data(s: str) -> list[Dot] | None:
     """Load graphs from DOT description in string `s`.
 
@@ -626,6 +810,20 @@ class Common:
     def get_attributes(self) -> AttributeDict:
         """Get attributes of the object"""
         return cast(AttributeDict, self.obj_dict.get("attributes", {}))
+
+    def interpret_esc_label(
+        self, attr: str = "label"
+    ) -> list[EscStringFragment]:
+        """Interpret an escString label attribute of this object.
+
+        Returns a list of text fragments and `LineBreak` items; see
+        `interpret_esc_string` for the substitution rules. The stored
+        attribute value is left untouched.
+        """
+        label = self.get(attr)
+        if label is None:
+            return []
+        return interpret_esc_string(str(label), self)
 
     def set_sequence(self, seq: int) -> None:
         """Set sequence"""
