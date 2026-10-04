@@ -22,7 +22,9 @@ from pyparsing import (
     DelimitedList,
     Forward,
     Group,
+    Keyword,
     Literal,
+    MatchFirst,
     OneOrMore,
     Optional,
     ParseException,
@@ -198,12 +200,23 @@ def push_ID(toks: ParseResults) -> str:
     return toks.html
 
 
-def push_node_id(toks: ParseResults) -> str:
-    out = []
-    for group in toks:
-        assert "id_part" in group
-        out.append(str(group.id_part))
-    return ":".join(out)
+class ParsedEdgeEndpoint(pydot.core.EdgeEndpoint):
+    """An endpoint parsed from DOT, retaining its original node token."""
+
+    raw_node_id: str
+
+
+def push_node_id(toks: ParseResults) -> pydot.core.EdgeEndpoint:
+    raw_node_id = str(toks.node_id)
+    node_id = pydot.core.unquote_dot_id(raw_node_id)
+    port = None
+    compass = str(toks.compass) if "compass" in toks else None
+    if "port" in toks:
+        port = pydot.core.unquote_dot_id(str(toks.port))
+
+    endpoint = ParsedEdgeEndpoint(node_id, port, compass)
+    object.__setattr__(endpoint, "raw_node_id", raw_node_id)
+    return endpoint
 
 
 def push_graph_stmt(toks: ParseResults) -> pydot.core.Subgraph:
@@ -241,9 +254,11 @@ def push_edge_stmt(toks: ParseResults) -> list[pydot.core.Edge]:
 
     def make_endpoint(
         ep: pydot.core.Common | list[Any] | str,
-    ) -> FrozenDict | str:
+    ) -> pydot.core.EdgeEndpointValue:
         if isinstance(ep, pydot.core.Subgraph):
             return FrozenDict(ep.obj_dict)
+        if isinstance(ep, pydot.core.EdgeEndpoint):
+            return ep
         return str(ep)
 
     edges = []
@@ -256,9 +271,20 @@ def push_edge_stmt(toks: ParseResults) -> list[pydot.core.Edge]:
 
 
 def push_node_stmt(toks: ParseResults) -> pydot.core.Node:
-    node_name = toks.name
+    endpoint = toks.name
+    assert isinstance(endpoint, ParsedEdgeEndpoint)
+    raw_node_id = endpoint.raw_node_id
+    node_name = raw_node_id
+    if endpoint.port is None and endpoint.compass is None:
+        port = None
+    else:
+        node_name = endpoint.node_id
+        port = pydot.core._endpoint_suffix(endpoint)
     attrs = expand_attr_lists(toks.attr_l)
-    return pydot.core.Node(str(node_name), **attrs)
+    node = pydot.core.Node(str(node_name), **attrs)
+    if port is not None:
+        node.obj_dict["port"] = port
+    return node
 
 
 class GraphParser:
@@ -300,9 +326,36 @@ class GraphParser:
 
     righthand_id: ClassVar[ParserElement] = float_number | ID
 
-    node_id: ClassVar[ParserElement] = DelimitedList(
-        Group(ID("id_part")), delim=":", min=1, max=3, combine=False
-    ).set_parse_action(push_node_id)
+    compass_direction: ClassVar[ParserElement] = MatchFirst(
+        Keyword(direction)
+        for direction in (
+            "ne",
+            "nw",
+            "se",
+            "sw",
+            "n",
+            "e",
+            "s",
+            "w",
+            "c",
+            "_",
+        )
+    )
+
+    edge_endpoint: ClassVar[ParserElement] = (
+        ID("node_id")
+        + Optional(
+            (
+                Suppress(":")
+                + Optional(ID, default="")("port")
+                + Suppress(":")
+                + compass_direction("compass")
+            )
+            | (Suppress(":") + compass_direction("compass"))
+            | (Suppress(":") + ID("port"))
+        )
+    )
+    edge_endpoint.set_parse_action(push_node_id)
 
     a_list: ClassVar[OneOrMore] = OneOrMore(
         ID + Optional("=" + righthand_id) + Optional(Suppress(","))
@@ -311,7 +364,7 @@ class GraphParser:
         Suppress("[") + Optional(a_list) + Suppress("]")
     )
     node_stmt: ClassVar[ParserElement] = (
-        node_id("name")
+        edge_endpoint("name")
         + Optional(attr_list("attr_l"))
         + Optional(Suppress(";"))
     )
@@ -334,7 +387,9 @@ class GraphParser:
     )
 
     edgeop: ClassVar[ParserElement] = Literal("--") | Literal("->")
-    edge_point: ClassVar[ParserElement] = subgraph | graph_stmt | node_id
+    edge_point: ClassVar[ParserElement] = (
+        subgraph | graph_stmt | edge_endpoint
+    )
     edge_stmt: ClassVar[ParserElement] = DelimitedList(
         edge_point, delim=edgeop, min=2
     )("endpoints") + Optional(attr_list("attr_l"))

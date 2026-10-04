@@ -12,6 +12,7 @@ import pyparsing as pp
 import pytest
 
 from pydot import dot_parser
+from pydot.core import EdgeEndpoint
 from pydot.dot_parser import HTML, GraphParser
 
 
@@ -203,8 +204,108 @@ def test_plus_concatenation() -> None:
     assert len(edges) == 1
     edge = edges[0]
     assert edge.get_source() == f"{nodes[1].get_name()}:p45:sw"
+    assert edge.get_destination().node_id == "myconcatenatedname"
+    assert edge.get_destination().port is None
+    assert edge.get_destination().compass == "ne"
     assert edge.get_destination() == '"myconcatenatedname":ne'
     assert edge.get("arrows") == '"both"'
+
+
+def test_structured_edge_endpoint_roundtrip() -> None:
+    src = textwrap.dedent(r'''
+        digraph G {
+            "api:v2";
+            "api:v2":v2:n -> x::ne;
+            y:"ne" -> z:"a\:b";
+        }''')
+    (graph,) = dot_parser.parse_dot_data(src)
+    node = graph.get_node('"api:v2"')[0]
+    edge_a, edge_b = graph.get_edges()
+
+    assert node.get_name() == '"api:v2"'
+    assert edge_a.get_source().node_id == "api:v2"
+    assert edge_a.get_source().port == "v2"
+    assert edge_a.get_source().compass == "n"
+    assert edge_a.get_destination().node_id == "x"
+    assert edge_a.get_destination().port == ""
+    assert edge_a.get_destination().compass == "ne"
+    assert edge_b.get_source().node_id == "y"
+    assert edge_b.get_source().port == "ne"
+    assert edge_b.get_source().compass is None
+    assert edge_b.get_destination().node_id == "z"
+    assert edge_b.get_destination().port == "a\\:b"
+
+    (reparsed,) = dot_parser.parse_dot_data(graph.to_string())
+    reparsed_edges = reparsed.get_edges()
+    assert reparsed_edges[0].get_source() == edge_a.get_source()
+    assert reparsed_edges[0].get_destination() == edge_a.get_destination()
+
+
+def test_colon_node_name_is_distinct_from_port_reference() -> None:
+    src = (
+        'digraph G { "api:v2"; "api:v2" -> z; '
+        'api:v2 -> "api:v2":v2:ne; }'
+    )
+    (graph,) = dot_parser.parse_dot_data(src)
+
+    assert graph.get_node('"api:v2"')[0].get_name() == '"api:v2"'
+    node_endpoint, port_reference = graph.get_edges()
+    assert node_endpoint.get_source().node_id == "api:v2"
+    assert node_endpoint.get_source().port is None
+    assert node_endpoint.get_source().compass is None
+    assert port_reference.get_source().node_id == "api"
+    assert port_reference.get_source().port == "v2"
+    assert port_reference.get_destination().node_id == "api:v2"
+    assert port_reference.get_destination().port == "v2"
+    assert port_reference.get_destination().compass == "ne"
+
+    (reparsed,) = dot_parser.parse_dot_data(graph.to_string())
+    reparsed_edges = reparsed.get_edges()
+    assert reparsed_edges[0].get_source() == node_endpoint.get_source()
+    assert reparsed_edges[1].get_source() == port_reference.get_source()
+    assert (
+        reparsed_edges[1].get_destination()
+        == port_reference.get_destination()
+    )
+
+
+def test_compass_directions_are_case_sensitive() -> None:
+    with pytest.raises(pp.ParseException):
+        GraphParser.edge_endpoint.parse_string("a:b:NE", parse_all=True)
+
+    with pytest.raises(pp.ParseException):
+        GraphParser.edge_endpoint.parse_string("a:b:north", parse_all=True)
+
+
+def test_legacy_endpoint_strings_distinguish_compass_and_port() -> None:
+    compass = EdgeEndpoint.from_string("n:ne")
+    port = EdgeEndpoint.from_string('n:"ne"')
+    plain_n = EdgeEndpoint.from_string("n")
+    plain_ne = EdgeEndpoint.from_string("ne")
+
+    assert (plain_n.node_id, plain_n.port, plain_n.compass) == (
+        "n",
+        None,
+        None,
+    )
+    assert (plain_ne.node_id, plain_ne.port, plain_ne.compass) == (
+        "ne",
+        None,
+        None,
+    )
+    assert (compass.node_id, compass.port, compass.compass) == (
+        "n",
+        None,
+        "ne",
+    )
+    assert (port.node_id, port.port, port.compass) == (
+        "n",
+        "ne",
+        None,
+    )
+
+    with pytest.raises(ValueError, match="empty port"):
+        EdgeEndpoint("a", "")
 
 
 def test_bad_parse_brace(capsys) -> None:

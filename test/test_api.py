@@ -147,11 +147,11 @@ def test_edge_missing_endpoints() -> None:
     assert pydot.Edge("a", "b").get_destination() == "b"
     assert pydot.Edge(("a", "b")).get_source() == "a"
     assert pydot.Edge(["a", "b"]).get_source() == "a"
-    assert pydot.Edge("", "").get_source() == ""
-    assert pydot.Edge("", "").get_destination() == ""
-    assert pydot.Edge("", "b").get_source() == ""
-    assert pydot.Edge("a", "").get_destination() == ""
-    assert pydot.Edge(("", "")).get_source() == ""
+    assert pydot.Edge("", "").get_source().node_id == ""
+    assert pydot.Edge("", "").get_destination().node_id == ""
+    assert pydot.Edge("", "b").get_source().node_id == ""
+    assert pydot.Edge("a", "").get_destination().node_id == ""
+    assert pydot.Edge(("", "")).get_source().node_id == ""
 
 
 def test_subgraphs() -> None:
@@ -428,15 +428,17 @@ def test_keywords_with_ports() -> None:
     eout = g.get_edges()[0]
     assert isinstance(eout, pydot.Edge)
     assert str(eout) == '"graph":"edge" -> "strict":"graph";'
-    n = pydot.Node(str(eout.get_source()))
-    assert n.get_name() == "graph"
-    assert n.get_port() == ":edge"
+    source = eout.get_source()
+    assert source.node_id == "graph"
+    assert source.port == "edge"
+    assert source.compass is None
 
 
-@pytest.mark.xfail(reason="The port logic is a broken mess")
 def test_broken_port_handling() -> None:
-    n = pydot.Node("edge:12", color="red")
-    e = pydot.Edge(n, "strict:node")
+    e = pydot.Edge(
+        pydot.EdgeEndpoint("edge", port="12"),
+        pydot.EdgeEndpoint("strict", port="node"),
+    )
     assert str(e) == '"edge":12 -- "strict":"node";'
 
 
@@ -668,7 +670,7 @@ def test_edge_quoting() -> None:
 def test_quote_id_with_embedded_double_quote() -> None:
     """Test that an embedded double quote in an ID is escaped (issue #187)."""
     assert pydot.Node('a"b').to_string() == '"a\\"b";'
-    assert pydot.Edge("a:b", 'c:"d"').to_string() == 'a:b -- c:"d";'
+    assert pydot.Edge("a:b", 'c:"d"').to_string() == 'a:b -- c:d;'
 
     g = pydot.Graph("G")
     g.add_edge(pydot.Edge('a"b', 'c"d'))
@@ -679,16 +681,32 @@ def test_quote_id_with_embedded_double_quote() -> None:
         """)
 
 
-@pytest.mark.xfail(reason="We mishandle two-colon (id:port:compass) endpoints")
 def test_edge_with_port_and_compass() -> None:
     g = pydot.Graph("G")
-    e = pydot.Edge("foo.bar:5:sw", '"red/blue":4:"nw"')
+    e = pydot.Edge(
+        pydot.EdgeEndpoint("foo.bar", "5", "sw"),
+        pydot.EdgeEndpoint("red/blue", "4", "nw"),
+    )
     g.add_edge(e)
     assert g.to_string() == textwrap.dedent("""\
         digraph G {
-        "foo.bar":5:sw -> "red/blue":4:"nw";
+        "foo.bar":5:sw -> "red/blue":4:nw;
         }
         """)
+
+
+def test_structured_endpoint_removes_colon_ambiguity() -> None:
+    node_named_api_v2 = pydot.EdgeEndpoint("api:v2")
+    api_v2_port = pydot.EdgeEndpoint("api", port="v2")
+
+    assert str(node_named_api_v2) == '"api:v2"'
+    assert str(api_v2_port) == "api:v2"
+    assert node_named_api_v2 != api_v2_port
+
+    graph = pydot.Dot(graph_type="digraph")
+    edge = pydot.Edge(node_named_api_v2, api_v2_port)
+    graph.add_edge(edge)
+    assert edge.to_string() == '"api:v2" -> api:v2;'
 
 
 def test_id_storage_and_lookup() -> None:
