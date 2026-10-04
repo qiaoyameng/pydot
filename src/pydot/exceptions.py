@@ -28,3 +28,20 @@ class Error(PydotException):
 
     def __str__(self) -> str:
         return self.value
+
+
+class LayoutError(Error, ValueError):
+    """A Graphviz layout attribute is missing or malformed."""
+
+    def __init__(
+        self,
+        value: str,
+        *,
+        object_type: str | None = None,
+        name: str | None = None,
+        source: object | None = None,
+    ) -> None:
+        super().__init__(value)
+        self.object_type = object_type
+        self.name = name
+        self.source = source

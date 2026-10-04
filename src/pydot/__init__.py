@@ -17,5 +17,11 @@ _logger.debug("pydot %s", __version__)
 
 
 from pydot.classes import FrozenDict  # noqa: F401, E402
+from pydot.layout import (  # noqa: F401, E402
+    LayoutHit,
+    LayoutIndex,
+    hit_at_layout,
+    hit_test_layout,
+)
 from pydot.core import *  # noqa: F403, E402
 from pydot.exceptions import *  # noqa: E402, F403
