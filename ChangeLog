@@ -9,7 +9,18 @@ Pydot versions since 1.4.2 adhere to [PEP 440-style semantic versioning]
 4.0.2 (unreleased)
 ------------------
 
-- Nothing changed yet.
+Added:
+- Added explicit node contraction via `pydot.contract_nodes()`.
+  Non-overlapping node groups are folded into single summary nodes,
+  returning a `ContractionResult` with the new graph and a full
+  provenance mapping: every original edge is accounted for in the
+  `origins` of a contracted edge or in the explicit `dropped`
+  records. Self-loop retention (`self_loops`) and parallel-edge
+  merging (`merge_parallel`) are explicit caller choices, attribute
+  conflicts require an explicit `attribute_reducer`, edges with ports
+  require a `port_map` (or contraction is refused with
+  `PortMappingError`), and nested-cluster membership conflicts raise
+  `ClusterConflictError` with per-member cluster paths.
 
 
 4.0.1 (2025-06-17)
