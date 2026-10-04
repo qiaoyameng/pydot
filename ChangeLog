@@ -9,7 +9,13 @@ Pydot versions since 1.4.2 adhere to [PEP 440-style semantic versioning]
 4.0.2 (unreleased)
 ------------------
 
-- Nothing changed yet.
+Added:
+- XDOT parser: added ``pydot.xdot`` to decode the drawing instructions in the
+  ``_draw_``/``_ldraw_`` attributes that Graphviz emits with ``-Txdot``.
+  ``parse_drawing`` returns a typed list of operations covering ellipses,
+  polylines, polygons, Bezier splines, text, fonts, colours (including
+  gradient descriptions), styles and line styles. Malformed instructions
+  are reported instead of silently consuming following instructions.
 
 
 4.0.1 (2025-06-17)
