@@ -11,6 +11,7 @@ import textwrap
 import pyparsing as pp
 import pytest
 
+import pydot
 from pydot import dot_parser
 from pydot.dot_parser import HTML, GraphParser
 
@@ -202,8 +203,12 @@ def test_plus_concatenation() -> None:
 
     assert len(edges) == 1
     edge = edges[0]
-    assert edge.get_source() == f"{nodes[1].get_name()}:p45:sw"
-    assert edge.get_destination() == '"myconcatenatedname":ne'
+    assert edge.get_source() == pydot.EdgeEndpoint(
+        "myconcatenated with ports", "p45", "sw"
+    )
+    assert edge.get_destination() == pydot.EdgeEndpoint(
+        "myconcatenatedname", None, "ne"
+    )
     assert edge.get("arrows") == '"both"'
 
 

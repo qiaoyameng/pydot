@@ -15,16 +15,17 @@ import re
 import subprocess
 import sys
 import warnings
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Sequence, Union, cast
 
 if TYPE_CHECKING:
     # `typing_extensions` is always available in `TYPE_CHECKING` blocks,
-    # even if not  installed
-    from typing_extensions import Self, TypeAlias
+    # even if not installed
+    from typing_extensions import Self
 
 import pydot
 from pydot._vendor import tempfile
-from pydot.classes import AttributeDict, EdgeEndpoint, FrozenDict
+from pydot.classes import AttributeDict, FrozenDict
 
 _logger = logging.getLogger(__name__)
 _logger.debug("pydot core module initializing")
@@ -272,6 +273,7 @@ def call_graphviz(
 def make_quoted(s: str) -> str:
     """Transform a string into a quoted string, escaping specials."""
     replace = {
+        ord("\\"): r"\\",
         ord('"'): r"\"",
         ord("\n"): r"\n",
         ord("\r"): r"\r",
@@ -290,10 +292,201 @@ re_html: Final[re.Pattern[str]] = re.compile(r"^<.*>$", re.S)
 id_re_alpha_nums: Final[re.Pattern[str]] = re.compile(
     r"^[_a-zA-Z][a-zA-Z0-9_]*$"
 )
-id_re_alpha_nums_with_ports: Final[re.Pattern[str]] = re.compile(
-    r"^[_a-zA-Z][a-zA-Z0-9_:]*[a-zA-Z0-9_]+$"
+
+COMPASS_POINTS: Final[frozenset] = frozenset(
+    {"n", "ne", "e", "se", "s", "sw", "w", "nw", "c", "_"}
 )
-id_re_with_port: Final[re.Pattern[str]] = re.compile(r"^([^:]*):([^:]*)$")
+
+
+def _split_dot_endpoint(value: str) -> list[tuple[str, bool]]:
+    """Split an endpoint ID into its DOT ID, port and compass parts."""
+    parts: list[list[str]] = [[]]
+    quoted = [False]
+    in_quotes = False
+    index = 0
+
+    if value.startswith("<"):
+        angle_count = 0
+        while index < len(value):
+            char = value[index]
+            if char == "<":
+                angle_count += 1
+            elif char == ">":
+                angle_count -= 1
+                if angle_count == 0:
+                    break
+            index += 1
+        parts[0].append(value[: index + 1])
+        index += 1
+        if index < len(value) and value[index] == ":":
+            parts.append([])
+            quoted.append(False)
+            index += 1
+        elif index < len(value):
+            raise ValueError(f"Invalid edge endpoint: {value!r}")
+
+    while index < len(value):
+        char = value[index]
+
+        if char == ":" and not in_quotes:
+            if len(parts) == 3:
+                raise ValueError(f"Invalid edge endpoint: {value!r}")
+            parts.append([])
+            quoted.append(False)
+            index += 1
+            continue
+
+        if char == '"':
+            quoted[-1] = True
+            in_quotes = True
+            index += 1
+            while index < len(value):
+                escaped = value[index]
+                if escaped == "\\" and index + 1 < len(value):
+                    parts[-1].append(value[index : index + 2])
+                    index += 2
+                    continue
+                if escaped == '"':
+                    index += 1
+                    in_quotes = False
+                    break
+                parts[-1].append(escaped)
+                index += 1
+            else:
+                raise ValueError(
+                    f"Unterminated quoted edge endpoint: {value!r}"
+                )
+            if index < len(value) and value[index] != ":":
+                raise ValueError(f"Invalid edge endpoint: {value!r}")
+            continue
+
+        parts[-1].append(char)
+        index += 1
+
+    return [
+        ("".join(part), was_quoted)
+        for part, was_quoted in zip(parts, quoted)
+    ]
+
+
+def _unquote_dot_id(value: str) -> str:
+    result: list[str] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and index + 1 < len(value):
+            escaped = value[index + 1]
+            if escaped in {'"', "\\"}:
+                result.append(escaped)
+                index += 2
+                continue
+            if escaped in {"\n", "\r"}:
+                if (
+                    escaped == "\r"
+                    and index + 2 < len(value)
+                    and value[index + 2] == "\n"
+                ):
+                    index += 3
+                else:
+                    index += 2
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+@dataclass(frozen=True)
+class EdgeEndpoint:
+    """A node endpoint with an optional port and compass direction."""
+
+    node_id: str
+    port: str | None = None
+    compass: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.node_id, str):
+            raise TypeError("Edge endpoint node ID must be a string")
+        if self.port is not None and not isinstance(self.port, str):
+            raise TypeError("Edge endpoint port must be a string or None")
+        if self.compass is not None:
+            if not isinstance(self.compass, str):
+                raise TypeError(
+                    "Edge endpoint compass must be a string or None"
+                )
+            if self.compass.lower() not in COMPASS_POINTS:
+                raise ValueError(
+                    f"Invalid compass direction: {self.compass!r}"
+                )
+            if self.compass != self.compass.lower():
+                raise ValueError(
+                    f"Invalid compass direction: {self.compass!r}"
+                )
+
+    @classmethod
+    def from_string(cls, value: str) -> EdgeEndpoint:
+        """Parse a legacy DOT endpoint string."""
+        raw_parts = _split_dot_endpoint(value)
+        parts = [
+            (_unquote_dot_id(part) if was_quoted else part, was_quoted)
+            for part, was_quoted in raw_parts
+        ]
+
+        if len(parts) == 1:
+            return cls(parts[0][0])
+        if len(parts) == 2:
+            port, was_quoted = parts[1]
+            if not was_quoted and port in COMPASS_POINTS:
+                return cls(parts[0][0], None, port)
+            return cls(parts[0][0], port)
+
+        node_id, port, compass = parts
+        if compass[1] or not compass[0]:
+            raise ValueError(f"Invalid compass direction: {compass[0]!r}")
+        if compass[0].lower() not in COMPASS_POINTS:
+            raise ValueError(f"Invalid compass direction: {compass[0]!r}")
+        if compass[0] != compass[0].lower():
+            raise ValueError(f"Invalid compass direction: {compass[0]!r}")
+        return cls(node_id[0], port[0], compass[0])
+
+    def to_dot_string(self) -> str:
+        """Return the endpoint represented in DOT syntax."""
+        result = quote_id_if_necessary(self.node_id)
+        if self.compass is not None:
+            if self.port == "":
+                result = self.node_id
+                result = f"{result}::{self.compass}"
+            elif self.port is None:
+                result = f"{result}::{self.compass}"
+            else:
+                port = quote_id_if_necessary(self.port)
+                result = f"{result}:{port}:{self.compass}"
+        elif self.port is not None:
+            port = "" if self.port == "" else quote_id_if_necessary(self.port)
+            result = f"{result}:{port}"
+        return result
+
+    def __str__(self) -> str:
+        return self.to_dot_string()
+
+
+def _dot_node_id(value: Any) -> str | None:
+    if isinstance(value, EdgeEndpoint):
+        return value.node_id
+    if isinstance(value, str):
+        try:
+            return EdgeEndpoint.from_string(value).node_id
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def _coerce_endpoint_string(value: str) -> EdgeEndpoint:
+    try:
+        return EdgeEndpoint.from_string(value)
+    except ValueError:
+        return EdgeEndpoint(value)
 
 
 def any_needs_quotes(s: str) -> bool | None:
@@ -310,7 +503,9 @@ def any_needs_quotes(s: str) -> bool | None:
     if s.isalnum():
         return s[0].isdigit()
 
-    has_high_chars = any(ord(c) > 0x7F or ord(c) == 0 for c in s)
+    has_high_chars = any(
+        ord(c) > 0x7F or ord(c) == 0 or ord(c) == ord("\\") for c in s
+    )
     if has_high_chars and not re_dbl_quoted.match(s) and not re_html.match(s):
         return True
 
@@ -345,16 +540,8 @@ def id_needs_quotes(s: str) -> bool:
     if any_result is not None:
         return any_result
 
-    for test_re in [
-        id_re_alpha_nums,
-        id_re_alpha_nums_with_ports,
-    ]:
-        if test_re.match(s):
-            return False
-
-    m = id_re_with_port.match(s)
-    if m:
-        return id_needs_quotes(m.group(1)) or id_needs_quotes(m.group(2))
+    if id_re_alpha_nums.match(s):
+        return False
 
     return True
 
@@ -702,13 +889,7 @@ class Node(Common):
             self.obj_dict["parent_graph"] = None
             self.obj_dict["sequence"] = None
 
-            # Remove the compass point
-            #
             port = None
-            if isinstance(name, str) and not name.startswith('"'):
-                idx = name.find(":")
-                if idx > 0 and idx + 1 < len(name):
-                    name, port = name[:idx], name[idx:]
 
             if isinstance(name, int):
                 name = str(name)
@@ -773,8 +954,9 @@ class Edge(Common):
     src: source node, subgraph or cluster
     dst: destination node, subgraph or cluster
 
-    `src` and `dst` can be specified as a `Node`, `Subgraph` or
-    `Cluster` object, or as the name string of such a component.
+    `src` and `dst` can be specified as an `EdgeEndpoint`, a
+    `Node`, `Subgraph` or `Cluster` object, or as a legacy name
+    string.
 
     All the attributes defined in the Graphviz dot language should
     be supported.
@@ -792,10 +974,30 @@ class Edge(Common):
 
     """
 
+    @staticmethod
+    def _coerce_endpoint(
+        value: Any,
+    ) -> EdgeEndpoint | FrozenDict | int | float:
+        if isinstance(
+            value, (EdgeEndpoint, FrozenDict, int, float)
+        ) and not isinstance(value, bool):
+            return value
+        if isinstance(value, Node):
+            endpoint = EdgeEndpoint.from_string(str(value.get_name()))
+            port = value.get_port()
+            if port:
+                return EdgeEndpoint(endpoint.node_id, port.lstrip(":"))
+            return endpoint
+        if isinstance(value, (Subgraph, Cluster)):
+            return EdgeEndpoint.from_string(str(value.get_name()))
+        if value is None:
+            raise pydot.Error("Edge endpoint cannot be None")
+        return _coerce_endpoint_string(str(value))
+
     def __init__(
         self,
-        src: EdgeDefinition | Sequence[EdgeDefinition] | None = None,
-        dst: EdgeDefinition | None = None,
+        src: Any = None,
+        dst: Any = None,
         obj_dict: AttributeDict | None = None,
         **attrs: Any,
     ) -> None:
@@ -812,22 +1014,8 @@ class Edge(Common):
             else:
                 _src, _dst = src, dst
 
-            ep0: EdgeEndpoint
-            ep1: EdgeEndpoint
-
-            if isinstance(_src, (Node, Subgraph, Cluster)):
-                ep0 = str(_src.get_name())
-            elif isinstance(_src, (FrozenDict, int, float)):
-                ep0 = _src
-            else:
-                ep0 = str(_src)
-
-            if isinstance(_dst, (Node, Subgraph, Cluster)):
-                ep1 = str(_dst.get_name())
-            elif isinstance(_dst, (FrozenDict, int, float)):
-                ep1 = _dst
-            else:
-                ep1 = str(_dst)
+            ep0 = self._coerce_endpoint(_src)
+            ep1 = self._coerce_endpoint(_dst)
 
             points = (ep0, ep1)
 
@@ -840,17 +1028,19 @@ class Edge(Common):
     def __str__(self) -> str:
         return self.to_string()
 
-    def _get_endpoint(self, position: int) -> EdgeEndpoint:
+    def _get_endpoint(
+        self, position: int
+    ) -> EdgeEndpoint | FrozenDict | int | float:
         ep = self.obj_dict["points"][position]
-        if isinstance(ep, (FrozenDict, int, float)):
+        if isinstance(ep, (EdgeEndpoint, FrozenDict, int, float)):
             return ep
-        return str(ep)
+        return EdgeEndpoint.from_string(str(ep))
 
-    def get_source(self) -> EdgeEndpoint:
+    def get_source(self) -> EdgeEndpoint | FrozenDict | int | float:
         """Get the edge's source endpoint."""
         return self._get_endpoint(0)
 
-    def get_destination(self) -> EdgeEndpoint:
+    def get_destination(self) -> EdgeEndpoint | FrozenDict | int | float:
         """Get the edge's destination endpoint."""
         return self._get_endpoint(1)
 
@@ -894,32 +1084,15 @@ class Edge(Common):
 
         return False
 
-    def parse_node_ref(self, node_ref: EdgeEndpoint) -> EdgeEndpoint:
+    def parse_node_ref(
+        self, node_ref: EdgeEndpoint | FrozenDict | int | float | str
+    ) -> EdgeEndpoint | FrozenDict | int | float:
+        if isinstance(node_ref, EdgeEndpoint):
+            return node_ref
         if not isinstance(node_ref, str):
             return node_ref
 
-        if node_ref.startswith('"') and node_ref.endswith('"'):
-            return node_ref
-
-        node_port_idx = node_ref.rfind(":")
-
-        if (
-            node_port_idx > 0
-            and node_ref[0] == '"'
-            and node_ref[node_port_idx - 1] == '"'
-        ):
-            return node_ref
-
-        if node_port_idx > 0:
-            a = node_ref[:node_port_idx]
-            b = node_ref[(node_port_idx + 1) :]
-
-            node = quote_id_if_necessary(a)
-            node += ":" + quote_id_if_necessary(b)
-
-            return node
-
-        return quote_id_if_necessary(node_ref)
+        return _coerce_endpoint_string(node_ref)
 
     def to_string(self, indent: Any = "", indent_level: int = 1) -> str:
         """Return string representation of edge in DOT language."""
@@ -936,7 +1109,11 @@ class Edge(Common):
                 )
             ]
         else:
-            edge = [str(src)]
+            edge = [
+                src.to_dot_string()
+                if isinstance(src, EdgeEndpoint)
+                else str(src)
+            ]
 
         if self.get_top_graph_type() == "digraph":
             edge.append("->")
@@ -951,7 +1128,11 @@ class Edge(Common):
                 )
             )
         else:
-            edge.append(str(dst))
+            edge.append(
+                dst.to_dot_string()
+                if isinstance(dst, EdgeEndpoint)
+                else str(dst)
+            )
 
         return f"{indent_str}{' '.join(edge)}{self.attrs_string(prefix=' ')};"
 
@@ -1292,6 +1473,14 @@ class Graph(Common):
         graph_edge.set_sequence(self.get_next_sequence_number())
         graph_edge.set_parent_graph(self.get_parent_graph())
 
+    @staticmethod
+    def _edge_endpoint(value: Any) -> Any:
+        if isinstance(value, (Node, str, int, float)) and not isinstance(
+            value, bool
+        ):
+            return Edge._coerce_endpoint(value)
+        return value
+
     def del_edge(
         self, src_or_list: Any, dst: Any = None, index: int | None = None
     ) -> bool:
@@ -1317,11 +1506,8 @@ class Graph(Common):
         else:
             src, dst = src_or_list, dst
 
-        if isinstance(src, Node):
-            src = src.get_name()
-
-        if isinstance(dst, Node):
-            dst = dst.get_name()
+        src = self._edge_endpoint(src)
+        dst = self._edge_endpoint(dst)
 
         if (src, dst) in self.obj_dict["edges"]:
             if index is not None and index < len(
@@ -1346,11 +1532,15 @@ class Graph(Common):
         An empty list is returned otherwise.
         """
         if isinstance(src_or_list, (list, tuple)) and dst is None:
-            edge_points = tuple(src_or_list)
+            edge_points = tuple(
+                self._edge_endpoint(point) for point in src_or_list
+            )
             edge_points_reverse = (edge_points[1], edge_points[0])
         else:
-            edge_points = (src_or_list, dst)
-            edge_points_reverse = (dst, src_or_list)
+            src = self._edge_endpoint(src_or_list)
+            dst = self._edge_endpoint(dst)
+            edge_points = (src, dst)
+            edge_points_reverse = (dst, src)
 
         match = []
 
@@ -1512,11 +1702,13 @@ class Graph(Common):
             edge_obj_dicts.extend(self.obj_dict["edges"][k])
 
         if edge_obj_dicts:
-            edge_ep_set = set(
-                itertools.chain.from_iterable(
+            edge_ep_set = {
+                _dot_node_id(endpoint)
+                for endpoint in itertools.chain.from_iterable(
                     obj["points"] for obj in edge_obj_dicts
                 )
-            )
+                if _dot_node_id(endpoint) is not None
+            }
         else:
             edge_ep_set = set()
 
@@ -1541,7 +1733,10 @@ class Graph(Common):
             if obj["type"] == "node":
                 node = Node(obj_dict=obj)
 
-                if skip_disconnected and node.get_name() not in edge_ep_set:
+                if skip_disconnected and (
+                    node.get_name() not in edge_ep_set
+                    and _dot_node_id(node.get_name()) not in edge_ep_set
+                ):
                     continue
 
                 node_str = node.to_string(
@@ -1986,5 +2181,14 @@ class Dot(Graph):
 __generate_format_methods(Dot)
 
 
-# Type alias for forward-referenced type
-EdgeDefinition: TypeAlias = Union[EdgeEndpoint, Node, Subgraph, Cluster]
+# Backwards-compatible typing aliases
+EdgeDefinition = Union[
+    EdgeEndpoint,
+    str,
+    int,
+    float,
+    FrozenDict,
+    Node,
+    Subgraph,
+    Cluster,
+]

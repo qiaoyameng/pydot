@@ -7,7 +7,10 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, Union
+from typing import TYPE_CHECKING, Any, Dict
+
+if TYPE_CHECKING:
+    from pydot.core import EdgeEndpoint
 
 
 class FrozenDict(dict):  # type: ignore
@@ -86,6 +89,12 @@ class FrozenDict(dict):  # type: ignore
         return f"FrozenDict({dict_repr})"
 
 
-# Backwards-compatible typing alias
 AttributeDict = Dict[str, Any]
-EdgeEndpoint = Union[str, int, float, FrozenDict]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "EdgeEndpoint":
+        from pydot.core import EdgeEndpoint
+
+        return EdgeEndpoint
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

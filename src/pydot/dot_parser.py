@@ -29,6 +29,7 @@ from pyparsing import (
     ParserElement,
     ParseResults,
     QuotedString,
+    Regex,
     Suppress,
     Token,
     Word,
@@ -36,6 +37,7 @@ from pyparsing import (
     c_style_comment,
     lineno,
     nums,
+    one_of,
     rest_of_line,
     unicode,
 )
@@ -206,6 +208,37 @@ def push_node_id(toks: ParseResults) -> str:
     return ":".join(out)
 
 
+def push_edge_node_id(toks: ParseResults) -> pydot.core.EdgeEndpoint:
+    def result_value(results: ParseResults, name: str) -> str | None:
+        value = results[name]
+        if isinstance(value, ParseResults):
+            if not value:
+                return None
+            return str(value[0])
+        return str(value)
+
+    node_id = result_value(toks, "node_id")
+    assert node_id is not None
+    port = result_value(toks, "port") if "port" in toks else None
+    if "compass" in toks:
+        compass = result_value(toks, "compass")
+    elif "compass_only" in toks:
+        compass = result_value(toks, "compass_only")
+    else:
+        compass = None
+    return pydot.core.EdgeEndpoint(node_id, port, compass)
+
+
+def push_edge_dbl_quoted(toks: ParseResults) -> str:
+    value = str(toks[0])
+    value = (
+        value.replace("\\\r\n", "")
+        .replace("\\\n", "")
+        .replace("\\\r", "")
+    )
+    return pydot.core._unquote_dot_id(value[1:-1])
+
+
 def push_graph_stmt(toks: ParseResults) -> pydot.core.Subgraph:
     g = pydot.core.Subgraph("")
     g.obj_dict["show_keyword"] = False
@@ -240,10 +273,12 @@ def push_edge_stmt(toks: ParseResults) -> list[pydot.core.Edge]:
     attrs = expand_attr_lists(toks.attr_l)
 
     def make_endpoint(
-        ep: pydot.core.Common | list[Any] | str,
-    ) -> FrozenDict | str:
+        ep: pydot.core.Common | list[Any] | str | pydot.core.EdgeEndpoint,
+    ) -> FrozenDict | pydot.core.EdgeEndpoint:
         if isinstance(ep, pydot.core.Subgraph):
             return FrozenDict(ep.obj_dict)
+        if isinstance(ep, pydot.core.EdgeEndpoint):
+            return ep
         return str(ep)
 
     edges = []
@@ -294,6 +329,25 @@ class GraphParser:
         | HTML().set_results_name("html")
     ).set_parse_action(push_ID)
 
+    edge_double_quoted: ClassVar[ParserElement] = Regex(
+        r'(?s)"(?:\\.|[^"\\])*"'
+    ).set_parse_action(push_edge_dbl_quoted)
+
+    edge_concat_string: ClassVar[DelimitedList] = DelimitedList(
+        edge_double_quoted, delim="+", min=2, combine=False
+    ).set_parse_action(lambda toks: "".join(str(tok) for tok in toks))
+
+    edge_ID: ClassVar[ParserElement] = (
+        edge_concat_string
+        | edge_double_quoted
+        | identifier
+        | HTML()
+    )
+
+    compass_point: ClassVar[ParserElement] = one_of(
+        "n ne e se s sw w nw c _", as_keyword=True
+    )
+
     float_number: ClassVar[Combine] = Combine(
         Optional("-") + OneOrMore(Word(nums + "."))
     )
@@ -303,6 +357,22 @@ class GraphParser:
     node_id: ClassVar[ParserElement] = DelimitedList(
         Group(ID("id_part")), delim=":", min=1, max=3, combine=False
     ).set_parse_action(push_node_id)
+
+    edge_node_id: ClassVar[ParserElement] = (
+        edge_ID("node_id")
+        + Optional(
+            Suppress(":")
+            + (
+                (
+                    Optional(edge_ID, default="")("port")
+                    + Suppress(":")
+                    + compass_point("compass")
+                )
+                | compass_point("compass_only")
+                | Optional(edge_ID, default="")("port")
+            )
+        )
+    ).set_parse_action(push_edge_node_id)
 
     a_list: ClassVar[OneOrMore] = OneOrMore(
         ID + Optional("=" + righthand_id) + Optional(Suppress(","))
@@ -334,7 +404,7 @@ class GraphParser:
     )
 
     edgeop: ClassVar[ParserElement] = Literal("--") | Literal("->")
-    edge_point: ClassVar[ParserElement] = subgraph | graph_stmt | node_id
+    edge_point: ClassVar[ParserElement] = subgraph | graph_stmt | edge_node_id
     edge_stmt: ClassVar[ParserElement] = DelimitedList(
         edge_point, delim=edgeop, min=2
     )("endpoints") + Optional(attr_list("attr_l"))
